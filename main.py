@@ -20,6 +20,9 @@ def main(config):
         elif merged_config["ALG"] == "RAINBOW":  
             from agents.rainbow.rainbow import single_run  
             run_fn = single_run
+        elif merged_config["ALG"] == "AGENT57":  
+            from agents.agent57.agent57 import single_run  
+            run_fn = single_run
 
         used_seed = starting_seed + seed
         print(f"Running seed {used_seed} ...")
