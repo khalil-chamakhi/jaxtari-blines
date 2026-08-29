@@ -5,7 +5,7 @@
 #            prioritised replay. Exploration is plain epsilon-greedy.
 #
 #   ngu      Never Give Up (Badia et al., 2020). Adds an intrinsic reward
-#            from episodic novelty (k-NN in a learned embedding space) j
+#            from episodic novelty (k-NN in a learned embedding space) 
 #            multiplied by a lifelong novelty modulator (RND). Trains a
 #            family of NUM_ARMS policies, each with its own (beta, gamma).
 #
@@ -42,9 +42,8 @@ from jaxatari.wrappers import (
     LogWrapper,
     FlattenObservationWrapper
 )
-from agents.agent57.agent57_eval import evaluate
+# from agents.agent57.agent57_eval import evaluate   # TODO: enable once eval is written
 from rtpt import RTPT
-
 def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False):
     assert mods is None or isinstance(mods, list), "mods must be None or a list of strings"
     if mods is not None and len(mods) == 0:
@@ -89,3 +88,11 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
         env = LogWrapper(env)
         return env
     return thunk
+def single_run(config:dict):
+    config = {k.upper(): v for k, v in config.items() if k != "alg"}
+    stage = config.get("STAGE", "r2d2")
+    assert stage in ("r2d2", "ngu", "split_q", "agent57"), f"unknown STAGE: {stage}"
+
+    print(f"[agent57] stage={stage} env={config['ENV_ID']} "
+          f"{'pixel' if config['PIXEL_BASED'] else 'oc'}")
+    return {"default": float("nan")}
