@@ -88,6 +88,53 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
         env = LogWrapper(env)
         return env
     return thunk
+#----torso--------------------------------------------------------------
+class Torso(nn.Module):
+    """Observation -> flat feature vector.
+    Width 512, depth 2, from Group 27's sweep (Raban confirmed in channel).
+   pixel  [R2D2] Table 2: "the same 3-layer convolutional network as DQN".
+   Copied verbatim from dqn.py's QNetwork: 32/64/64, kernels 8/4/3,
+   strides 4/2/1, padding VALID. 4 stacked 84x84 frames -> 3136 features (7x7x64).
+    """
+    pixel_based: bool 
+    mlp_width: int = 512
+    mlp_depth: int = 2
+    @nn.compact
+    def __call__(self, x):
+        if self.pixel_based:
+            #observations are stored in this format:(batch, channels, height, width)and flax's Conv expect (batch, height, width, channels)
+            x = jnp.transpose(x, (0, 2, 3, 1))
+            x= x.astype(jnp.float32) / 255.0 # the netork expects float32 inputs in [0,1]
+            x = nn.Conv(32, kernel_size=(8, 8), strides=(4, 4), padding="VALID")(x)
+            x = nn.relu(x)
+            x = nn.Conv(64, kernel_size=(4, 4), strides=(2, 2), padding="VALID")(x)
+            x = nn.relu(x)
+            x = nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding="VALID")(x)
+            x = nn.relu(x)
+            x = x.reshape((x.shape[0], -1))
+        else:
+            for i in range(self.mlp_depth):
+                x = nn.Dense(self.mlp_width, kernel_init=orthogonal(np.sqrt(2.0)),bias_init=constant(0.0))(x)
+                x = nn.relu(x)
+        return x
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @flax.struct.dataclass
 class TimeStep:
    

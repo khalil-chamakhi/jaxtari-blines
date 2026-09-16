@@ -18,7 +18,6 @@ PIXEL_BASED: True
 NATIVE_DOWNSCALING: True
 
 TOTAL_TIMESTEPS: 10000000
-# BUFFER_SIZE: 1000000           # 28224 elements x uint8 ~= 28 KB/transition  => ~28 GB. Impossible on any hardware we have.
 BUFFER_SIZE: 100000              # ~2.8 GB. Matches dqn_rgb / rainbow_rgb, which both comment out the 1e6 line for the same reason.
 LEARNING_STARTS: 80000
 TARGET_NETWORK_FREQUENCY: 2500   # [R2D2] counts LEARNER steps, not env steps
@@ -26,8 +25,8 @@ SCAN_STEPS: 1000
 GRADIENT_STEPS: 1                # -1 == n_envs * train_freq
 
 NUM_ENVS: 1
-LEARNING_RATE: 2e-4              # [R2D2] paper value; dqn uses 1e-4
-ADAM_EPS: 1e-6                   # [R2D2] paper value; dqn.py hardcodes 1e-4
+LEARNING_RATE: 1e-4              
+ADAM_EPS: 1e-3                   
 ADAM_B1: 0.9                     # [R2D2] same as optax's default — listed
 ADAM_B2: 0.999                   #  explicitly so the config is a complete record of the paper's optimiser settings. Must be passed to optax.adam in single_run, dqn/rainbow don't pass betas at all.
 
@@ -45,17 +44,18 @@ N_STEP: 5                        # [R2D2] n-step double Q-learning
 PRIORITY_EXPONENT: 0.9           # [R2D2] rainbow uses 0.5
 PRIORITY_ETA: 0.9                # [R2D2] priority = eta*max|TD| + (1-eta)*mean|TD|
 IMPORTANCE_SAMPLING_EXPONENT: 0.6  # [R2D2] fixed 0.6
+VALUE_RESCALING_EPSILON: 1e-3    # [R2D2] h(x) = sign(x)*(sqrt(|x|+1)-1) + eps*x . Use rlax's signed_hyperbolic / signed_parabolic.
 
 # --- network architecture -------------------------------------------------
-# torso -> pre-LSTM linear -> LSTM -> post-LSTM linear -> dueling head.
-# Layer sizes confirmed against the R2D2 hyperparameter table.
-# Pixel mode uses the CNN torso, not an MLP. [R2D2]'s torso is 4 conv layers:
-# channels 32/64/128/128, kernels 7/5/5/3, strides 4/2/2/1.
-# Note this is deeper than dqn.py's 3-layer torso.
-PRE_LSTM_UNITS: 512              # [R2D2] linear layer between torso and LSTM
+# [R2D2] Table 2: same 3-layer conv torso as DQN (32/64/64, kernels 8/4/3,
+# strides 4/2/1), then LSTM(512), then dueling value and advantage heads,
+# each with a 512 hidden layer. No pre- or post-LSTM linear layers.
+#
+# An earlier draft used a 4-layer torso taken from Schaul et al. 2022 — that
+# is that paper's own R2D2 variant, not R2D2.
+
 HIDDEN_SIZE: 512                 # [R2D2] LSTM hidden units
-POST_LSTM_UNITS: 256             # [R2D2] linear layer between LSTM and head
-DUELING_UNITS: 256               # [R2D2] each of the V and A branches is 256 wide
+DUELING_UNITS: 512              # [R2D2] each of the V and A heads
 
 START_E: 1.0                     # DQN anneals 1.0 -> 0.01. R2D2 uses a FIXED
 END_E: 0.01                      #   epsilon of 0.01. Kept DQN's schedule for

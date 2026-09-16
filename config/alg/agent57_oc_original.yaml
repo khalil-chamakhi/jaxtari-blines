@@ -18,18 +18,17 @@ PIXEL_BASED: False
 NATIVE_DOWNSCALING: True
 
 TOTAL_TIMESTEPS: 10000000
-BUFFER_SIZE: 1000000             # transitions, same unit as dqn/rainbow.[R2D2] uses 4e6 observations; we keep dqn's 1e6 for comparability. 
-                                 #104 elements x float32# ~= 441 B/transition => ~441 MB.
+BUFFER_SIZE: 1000000             
 LEARNING_STARTS: 80000
 TARGET_NETWORK_FREQUENCY: 2500   # [R2D2] counts LEARNER steps, not env steps
 SCAN_STEPS: 1000
 GRADIENT_STEPS: 1                # -1 == n_envs * train_freq
 
 NUM_ENVS: 1
-LEARNING_RATE: 2e-4              # [R2D2] paper value; dqn uses 1e-4
-ADAM_EPS: 1e-6                   # [R2D2] paper value; dqn.py hardcodes 1e-4
-ADAM_B1: 0.9                     # [R2D2] same as optax's default — listed
-ADAM_B2: 0.999                   #  explicitly so the config is a complete record of the paper's optimiser settings. Must be passed to optax.adam in single_run, dqn/rainbow don't pass betas at all.
+LEARNING_RATE: 1e-4             
+ADAM_EPS: 1e-3                  
+ADAM_B1: 0.9                    
+ADAM_B2: 0.999                  
 
 BATCH_SIZE: 64                   # [R2D2] 64 SEQUENCES, not transitions: 64 x 80 = 5120 transitions per update vs DQN's 32. Note this in the report.
 TRAIN_FREQUENCY: 4
@@ -45,17 +44,18 @@ N_STEP: 5                        # [R2D2] n-step double Q-learning
 PRIORITY_EXPONENT: 0.9           # [R2D2] rainbow uses 0.5
 PRIORITY_ETA: 0.9                # [R2D2] priority = eta*max|TD| + (1-eta)*mean|TD|
 IMPORTANCE_SAMPLING_EXPONENT: 0.6  # [R2D2] fixed 0.6
+VALUE_RESCALING_EPSILON: 1e-3    # [R2D2] h(x) = sign(x)*(sqrt(|x|+1)-1) + eps*x . Use rlax's signed_hyperbolic / signed_parabolic.
 
 # --- network architecture -------------------------------------------------
-# torso -> pre-LSTM linear -> LSTM -> post-LSTM linear -> dueling head.
-# Layer sizes confirmed against the R2D2 hyperparameter table.
+# [R2D2] Table 2: torso -> LSTM(512) -> dueling value and advantage heads,
+# each with a 512 hidden layer. No pre- or post-LSTM linear layers.
+# The paper is pixel-only, so the object-centric torso has no counterpart
+# there. 512x512 from Group 27's sweep; Raban confirmed in the channel.
 
-MLP_WIDTH: 512                   # OC torso; Group 27's sweep, Raban confirmed
-MLP_DEPTH: 2                     #   in channel. Pixel mode uses the CNN torso.
-PRE_LSTM_UNITS: 512              # [R2D2] linear layer between torso and LSTM
+MLP_WIDTH: 512                   # OC torso
+MLP_DEPTH: 2                     # Pixel mode uses the CNN torso.
 HIDDEN_SIZE: 512                 # [R2D2] LSTM hidden units
-POST_LSTM_UNITS: 256             # [R2D2] linear layer between LSTM and head
-DUELING_UNITS: 256               # [R2D2] each of the V and A branches is 256 wide
+DUELING_UNITS: 512               # [R2D2] each of the V and A heads
 
 START_E: 1.0                     # DQN anneals 1.0 -> 0.01. R2D2 uses a FIXED
 END_E: 0.01                      #   epsilon of 0.01. Kept DQN's schedule for
