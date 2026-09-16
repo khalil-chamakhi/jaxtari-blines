@@ -88,35 +88,41 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
         env = LogWrapper(env)
         return env
     return thunk
+@flax.struct.dataclass
+class TimeStep:
+   
+    obs: jnp.ndarray            # observation BEFORE acting OC: (104,) float32. Pixel: (4,84,84) uint8.
+    action: jnp.ndarray         # action index, 0..action_dim-1
+    reward: jnp.ndarray         # extrinsic reward, clipped during training
+    done: jnp.ndarray           # episode ended here; zeroes the future term  in the Q target
+
+    prev_action: jnp.ndarray    # [R2D2] the LSTM input carries the previous
+    prev_reward: jnp.ndarray    #   action and reward, not just the observation. Must be STORED: a sampled sequence has no access to the step before it.
+
+
+    arm: jnp.ndarray            # which of the 8 (beta, gamma) policies acted
+    intrinsic_reward: jnp.ndarray   # curiosity reward for this step
+
 def single_run(config:dict):
     config = {k.upper(): v for k, v in config.items() if k != "alg"}
     stage = config.get("STAGE", "r2d2")
     assert stage in ("r2d2", "ngu", "split_q", "agent57"), f"unknown STAGE: {stage}"
 
-    # Three separate random number generators need seeding, because three
-    # different libraries produce randomness here:
-    #   random  — Python's own, used by any plain-Python sampling
-    #   np      — numpy, used by wandb and some wrappers
-    #   key     — JAX's. JAX has no global RNG state; you hold an explicit key
-    #             and split it whenever you need fresh randomness. Reusing a
-    #             key gives identical "random" numbers, which is a real bug.
-    # Seeding all three is what makes a run reproducible.
+   # do not modify the seeding
     random.seed(config["SEED"])
     np.random.seed(config["SEED"])
     key = jax.random.PRNGKey(config["SEED"])
 
-    # Build the environment. make_env returns a thunk (a zero-argument
-    # function), so the trailing () is what actually constructs it.
+    
     env = make_env(
-        config["ENV_ID"],                          # which game
-        list(config.get("TRAIN_MODS", [])),        # game modifications, [] = none
-        config["PIXEL_BASED"],                     # pixels vs object-centric
-        config.get("NATIVE_DOWNSCALING", True),    # pixel mode only
-        False,                                     # eval=False: episodic_life on,
-                                                   #   rewards clipped for training
+        config["ENV_ID"],                         
+        list(config.get("TRAIN_MODS", [])),       
+        config["PIXEL_BASED"],                    
+        config.get("NATIVE_DOWNSCALING", True),    
+        False,                                    
     )()
 
-    # Read the shapes FROM THE ENVIRONMENT .
+   
     action_dim = env.action_space().n
     obs_shape = env.observation_space().shape
 
@@ -125,19 +131,47 @@ def single_run(config:dict):
     if config["PIXEL_BASED"]:
         obs_shape = obs_shape[:-1]
 
-    # Buffer sizing, printed so we always know where we stand against the
-    # 11GB card. Pixel obs are uint8 (1 byte each); object-centric obs go
-    # through a normalisation wrapper and are float32 (4 bytes each).
+
     # Getting this dtype wrong is the classic silent failure: a uint8 buffer
     # rounds a normalised 0.47 to 0 and the agent trains on nothing.
     obs_bytes = int(np.prod(obs_shape)) * (1 if config["PIXEL_BASED"] else 4)
     buffer_gb = config["BUFFER_SIZE"] * obs_bytes / 1e9
 
-    print(f"[agent57] stage={stage} env={config['ENV_ID']} "
-          f"{'pixel' if config['PIXEL_BASED'] else 'oc'}")
-    print(f"[agent57] action_dim={action_dim} obs_shape={obs_shape} "
-          f"obs_bytes={obs_bytes}")
+    # --- replay buffer -----------------------------------------------------
+
+    num_envs = config["NUM_ENVS"]
+    seq_len = config["SEQUENCE_LENGTH"]
+
+    replay_buffer = fbx.make_prioritised_trajectory_buffer(
+        add_batch_size=num_envs,
+        sample_batch_size=config["BATCH_SIZE"],       # 64 sequences per update
+        sample_sequence_length=seq_len,               # [R2D2] m = 80
+        period=config["SEQUENCE_PERIOD"],             # stride between starts -> 40-step overlap
+        min_length_time_axis=seq_len,                 # refuse to sample before this exists
+        max_length_time_axis=config["BUFFER_SIZE"] // num_envs,
+        priority_exponent=config["PRIORITY_EXPONENT"],
+    )
+    key, reset_key = jax.random.split(key)
+    dummy_obs, _ = env.reset(reset_key)
+    dummy_obs = dummy_obs.reshape(obs_shape)
+
+    dummy_timestep = TimeStep(
+        obs=dummy_obs,
+        action=jnp.zeros((), dtype=jnp.int32),
+        reward=jnp.zeros((), dtype=jnp.float32),
+        done=jnp.zeros((), dtype=jnp.bool_),
+        prev_action=jnp.zeros((), dtype=jnp.int32),
+        prev_reward=jnp.zeros((), dtype=jnp.float32),
+        arm=jnp.zeros((), dtype=jnp.int32),
+        intrinsic_reward=jnp.zeros((), dtype=jnp.float32),
+    )
+
+    buffer_state = replay_buffer.init(dummy_timestep)
+
+    print(f"[agent57] stage={stage} env={config['ENV_ID']} "f"{'pixel' if config['PIXEL_BASED'] else 'oc'}")
+    print(f"[agent57] action_dim={action_dim} obs_shape={obs_shape} " f"obs_bytes={obs_bytes}")
     print(f"[agent57] buffer: {config['BUFFER_SIZE']} transitions = {buffer_gb:.2f} GB")
+    print(f"[agent57] buffer storage: {buffer_state.experience.obs.shape} "f"dtype={buffer_state.experience.obs.dtype}")
 
     # main.py expects a dict back from every agent. nan means "no score yet";
     # returning 0 would look like a real score of zero.

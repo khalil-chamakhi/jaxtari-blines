@@ -9,18 +9,20 @@ Keep this updated as values change. Reconstructing reasoning in week six does no
 
 ## Measured, not guessed
 
-Observation shapes, read from the environment on Pong (2026-08):
+Observation shapes, read from the environment on Pong :
 
 | Mode | Shape | Elements | Dtype | Bytes/transition |
 |---|---|---|---|---|
-| Object-centric | `(104,)` | 104 | float32 | ~441 |
-| Pixel | `(4, 84, 84)` | 28,224 | uint8 | ~28,250 |
+| Object-centric | `(104,)` | 104 | float32 | 416|
+| Pixel | `(4, 84, 84)` | 28,224 | uint8 | 28,224 |
 
-Object-centric is 26 features x 4 stacked frames. Pixel is 4 stacked 84x84 grayscale
-frames. The ~25 bytes on top of the observation are action, reward, done, prev_action
-and prev_reward.
+Object-centric is 26 features x 4 stacked frames. Pixel is 4 stacked 84x84 grayscale frames.
+The six scalar fields in `TimeStep` (action, reward, done, prev_action, prev_reward,
+arm, intrinsic_reward) add roughly 25 bytes per transition on top of the observation.
+Negligible for pixel mode, ~6% for object-centric. The buffer-size print in
+`single_run` counts the observation only.
 
-**Pixel observations are 270x heavier than object-centric.** Every memory decision
+**Pixel observations are 68x heavier than object-centric.** Every memory decision
 below follows from that one fact.
 
 Note the element count varies per game — Montezuma has more objects than Pong, so its
@@ -66,13 +68,29 @@ sequences, which would have made our config silently incomparable to the neighbo
 ones.
 
 **The uint8 dtype is load-bearing.** Storing pixel observations as float32 turns 2.8 GB
-into 11.3 GB — instantly impossible. This is what the `rainbow.py:244` pattern
+into 11.3 GB — instantly impossible. 
 (`uint8 if PIXEL_BASED else float32`) protects. Object-centric observations pass through
 a normalisation wrapper and genuinely are float32; storing *those* as uint8 rounds 0.47
 to 0 and silently destroys them. The dtype must follow the mode, both directions.
+See the implementation section below for how we made this structural rather than a
+thing to remember
+
 
 ---
-
+## Measured throughput
+DQN, Pong, object-centric, `NUM_ENVS=8`, 200k steps:
+| Machine | SPS | Compile | Projected 10M steps |
+|---|---|---|---|
+| RTX 3060 (local) | 267 | 134 s | ~10.4 h |
+| RTX 2080 Ti (mlsp2) | 1252 | 29 s | ~2.2 h |
+The pool is 4.7x faster than the local card — more than raw hardware explains, so some
+of it is the server's CPU handling environment stepping, and possibly the laptop GPU
+also driving a display.
+**Treat 1252 SPS as an upper bound.** This is our cheapest configuration. R2D2 does
+~160x more work per gradient update (see the batch-size caveat below), and pixel mode
+is far heavier than OC. Re-time once R2D2 actually runs; every M5 planning decision
+should use that number, not this one.
+---
 ## R2D2 hyperparameters — all verified against the paper's table
 
 No UNVERIFIED markers remain in either config.
@@ -107,8 +125,7 @@ torso -> pre-LSTM linear -> LSTM -> post-LSTM linear -> dueling head
 | `DUELING_UNITS` | 256 (each of the V and A branches) |
 
 **Pixel torso is 4 conv layers**: channels 32/64/128/128, kernels 7/5/5/3, strides
-4/2/2/1. This is *deeper than dqn.py's 3-layer torso* — Pratik cannot reuse `QNetwork`
-unchanged.
+4/2/2/1. This is *deeper than dqn.py's 3-layer torso* — `QNetwork` cannot be reused unchanged.
 
 **Caveat on the source.** The table we read was reproduced in a later DeepMind paper
 describing its own R2D2 variant (Schaul et al., "The Phenomenon of Policy Churn",
@@ -117,25 +134,6 @@ the original paper says 2500 learner steps — so that table has been modified f
 reduced-scale setup. Architecture numbers are trustworthy; prefer the original paper
 wherever training hyperparameters disagree.
 
----
-
-## Confirmed externally
-
-**`MLP_WIDTH: 512`, `MLP_DEPTH: 2`** (object-centric only) — Group 27 ran a width sweep
-on Pong in object-centric mode with everything else held fixed:
-
-| Network | Final return at 10M frames |
-|---|---|
-| 512 x 512 | +18.0, solved and plateaued |
-| 128 -> 64 -> 32 | +12.4, solved late, still rising |
-| 64 -> 32 -> 16 | -2.4, mostly flat |
-
-Only 512x512 plateaued within the budget. Raban confirmed 512x512 in the channel. We
-do not need to repeat this experiment — cite Group 27 and the channel confirmation.
-
-These two keys are absent from the pixel config, which uses the CNN torso instead.
-
----
 
 ## Inherited from the repo, unchanged
 
@@ -156,6 +154,47 @@ command line for faster local iteration, but the file matches the others.
 changing, change it in both files and say so in the PR.
 
 ---
+---
+## Implementation decisions (stage 1 setup)
+### Buffer dtype comes from the environment, not from us
+`buffer.init()` fixes the storage dtype permanently. We build the dummy `TimeStep`
+from a real `env.reset()` rather than `jnp.zeros(shape, dtype=...)`, so the dtype is
+whatever the wrappers actually produce. Verified on Pong:
+| Mode | Buffer storage | Dtype |
+|---|---|---|
+| Object-centric | `(1, 1000000, 104)` | float32 |
+| Pixel | `(1, 100000, 4, 84, 84)` | uint8 |
+This makes the uint8/float32 trap impossible rather than merely avoided. Hand-writing
+the dtype would work right up until someone changed the wrapper chain.
+### TimeStep carries the NGU fields from stage 1
+`arm` and `intrinsic_reward` are in the dataclass now, zero-filled, though nothing
+reads them until stage 2. `buffer.init()` fixes the layout permanently, so adding a
+field later means rebuilding the buffer and discarding everything collected. Two
+scalars cost 8 bytes against a 416-byte observation.
+`prev_action` and `prev_reward` are there because R2D2's LSTM input carries them, not
+just the observation. They must be *stored* rather than recomputed: a sampled sequence
+has no access to the step before it.
+The LSTM hidden state is deliberately **not** in `TimeStep` — it is stored once per
+sequence (every `SEQUENCE_PERIOD` steps), not once per transition. Storing it
+per-transition would be 80x redundant.
+### BUFFER_SIZE to flashbax translation
+flashbax's trajectory buffer stores a `(num_envs, time)` grid, so:
+```python
+max_length_time_axis = BUFFER_SIZE // NUM_ENVS
+```
+With `NUM_ENVS: 1` that is one row of 1,000,000 steps. **Raising `NUM_ENVS` shortens
+the per-env history rather than using more memory** — worth knowing before someone
+raises it for speed and wonders why sequences run short.
+### Diagnostic prints and their expiry
+| Print | Keep until |
+|---|---|
+| stage / env / mode | permanent — four ablation rungs produce four logs |
+| action_dim / obs_shape | permanent — first question when a new game breaks |
+| buffer size + dtype | remove once confirmed to fit on the pool |
+`action_dim` prints 6 on Pong and should print 18 on Montezuma. That is the check that
+catches a hardcoded action space — the classic failure that works on Pong and silently
+breaks everywhere else.
+
 
 ## Deliberate deviations from the paper
 
