@@ -323,7 +323,7 @@ def single_run(config:dict):
     # rounds a normalised 0.47 to 0 and the agent trains on nothing.
     obs_bytes = int(np.prod(obs_shape)) * (1 if config["PIXEL_BASED"] else 4)
     carry_bytes = 2 * hidden * 4
-    buffer_gb = config["BUFFER_SIZE"] * obs_bytes / 1e9
+    buffer_gb = config["BUFFER_SIZE"] * (obs_bytes + carry_bytes) / 1e9
     # --- env helpers (copied from dqn.py) -----------------------------------
     @jax.jit
     def vmap_reset(rng):
@@ -404,7 +404,7 @@ def single_run(config:dict):
             random_actions = jax.random.randint(action_rng, (num_envs,), 0, action_dim)
             explore_mask = jax.random.uniform(explore_rng, (num_envs,)) < epsilon
             actions = jnp.where(explore_mask, random_actions, greedy_actions)
-            ext_obs, env_state, rewards, next_done, info = vmap_step(env_state, actions)
+            next_obs, env_state, rewards, next_done, info = vmap_step(env_state, actions)
             timestep = TimeStep(
                 obs=obs,
                 action=actions,

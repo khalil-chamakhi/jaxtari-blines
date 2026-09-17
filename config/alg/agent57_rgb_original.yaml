@@ -34,7 +34,6 @@ BATCH_SIZE: 64                   # [R2D2] 64 SEQUENCES, not transitions: 64 x 80
 TRAIN_FREQUENCY: 4
 GAMMA: 0.99                      # same as dqn. R2D2 uses 0.997 -> report adaptation
 TAU: 1.0
-
 # --- sequence replay  ------------------------
 
 SEQUENCE_LENGTH: 80              # [R2D2] m = 80 observations per sequence
