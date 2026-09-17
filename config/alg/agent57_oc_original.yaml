@@ -32,7 +32,7 @@ ADAM_B2: 0.999
 
 BATCH_SIZE: 64                   # [R2D2] 64 SEQUENCES, not transitions: 64 x 80 = 5120 transitions per update vs DQN's 32. Note this in the report.
 TRAIN_FREQUENCY: 4
-GAMMA: 0.997                     # [R2D2] confirmed; dqn uses 0.99
+GAMMA: 0.99                      # same as dqn. R2D2 uses 0.997 -> report adaptation
 TAU: 1.0
 
 # --- sequence replay  ------------------------
@@ -57,6 +57,6 @@ MLP_DEPTH: 2                     # Pixel mode uses the CNN torso.
 HIDDEN_SIZE: 512                 # [R2D2] LSTM hidden units
 DUELING_UNITS: 512               # [R2D2] each of the V and A heads
 
-START_E: 1.0                     # DQN anneals 1.0 -> 0.01. R2D2 uses a FIXED
-END_E: 0.01                      #   epsilon of 0.01. Kept DQN's schedule for
-EXPLORATION_FRACTION: 0.10       #   comparability — see open question for Raban.
+START_E: 1.0                     # same as dqn: linear 1.0 -> 0.01
+END_E: 0.01                      #   over the first 10% of TOTAL_TIMESTEPS.
+EXPLORATION_FRACTION: 0.10       #   R2D2 uses its own epsilon scheme -> report adaptation

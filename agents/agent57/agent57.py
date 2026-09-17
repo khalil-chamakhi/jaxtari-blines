@@ -126,8 +126,7 @@ class RecurrentQNetwork(nn.Module):
     heads each with a 512 hidden layer. The LSTM also receives the previous
     reward and a one-hot of the previous action.
 
-    Recurrent, so the signature carries state:
-        new_carry, q_values = net(carry, obs, prev_action, prev_reward)
+    Recurrent, so the signature carries state:new_carry, q_values = net(carry, obs, prev_action, prev_reward)
     """
     
     action_dim: int
