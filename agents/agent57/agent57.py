@@ -117,7 +117,58 @@ class Torso(nn.Module):
                 x = nn.Dense(self.mlp_width, kernel_init=orthogonal(np.sqrt(2.0)),bias_init=constant(0.0))(x)
                 x = nn.relu(x)
         return x
-        
+
+#----RecurrentQnetwork--------------------------------------------------------------
+class RecurrentQNetwork(nn.Module):
+    """Torso -> LSTM -> dueling head. The full R2D2 Q-network.
+
+    [R2D2] Table 2: torso, then LSTM(512), then dueling value and advantage
+    heads each with a 512 hidden layer. The LSTM also receives the previous
+    reward and a one-hot of the previous action.
+
+    Recurrent, so the signature carries state:
+        new_carry, q_values = net(carry, obs, prev_action, prev_reward)
+    """
+    
+    action_dim: int
+    pixel_based: bool
+    hidden_size: int = 512
+    dueling_units: int = 512
+    mlp_width: int = 512
+    mlp_depth: int = 2
+
+    @nn.compact
+    def __call__(self, carry, obs, prev_action, prev_reward):
+        x = Torso(pixel_based=self.pixel_based,mlp_width=self.mlp_width,mlp_depth=self.mlp_depth)(obs)
+
+        # [R2D2] the LSTM input carries the previous action and reward.
+        x = jnp.concatenate([
+            x,
+            jax.nn.one_hot(prev_action, self.action_dim),
+            prev_reward[:, None],
+        ], axis=-1)
+
+        carry, x = nn.OptimizedLSTMCell(self.hidden_size)(carry, x)
+
+        # Dueling head: V says how good the state is, A says how much better
+        # each action is than average. 
+        v = nn.Dense(self.dueling_units)(x)
+        v = nn.relu(v)
+        v = nn.Dense(1)(v)
+
+        a = nn.Dense(self.dueling_units)(x)
+        a = nn.relu(a)
+        a = nn.Dense(self.action_dim)(a)
+
+        q = v + (a - a.mean(axis=-1, keepdims=True))
+        return carry, q
+
+    @staticmethod
+    def initial_carry(batch_size, hidden_size=512):
+        """Zeroed (c, h). An LSTM carries two vectors, not one."""
+        return nn.OptimizedLSTMCell(hidden_size).initialize_carry(
+            jax.random.PRNGKey(0), (batch_size, hidden_size)
+        )
 
 
 
