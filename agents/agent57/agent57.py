@@ -173,6 +173,10 @@ class RecurrentQNetwork(nn.Module):
 
 
 
+class Agent57TrainState(TrainState):
+    target_params: flax.core.FrozenDict
+
+
 @flax.struct.dataclass
 class TimeStep:
    
@@ -405,6 +409,7 @@ def single_run(config:dict):
             explore_mask = jax.random.uniform(explore_rng, (num_envs,)) < epsilon
             actions = jnp.where(explore_mask, random_actions, greedy_actions)
             next_obs, env_state, rewards, next_done, info = vmap_step(env_state, actions)
+            rewards = rewards.astype(jnp.float32)   # env clips to int32; the buffer and loss use float32
             timestep = TimeStep(
                 obs=obs,
                 action=actions,
@@ -450,5 +455,121 @@ def single_run(config:dict):
     print(f"[agent57] buffer storage: {buffer_state.experience.obs.shape} "f"dtype={buffer_state.experience.obs.dtype}")
 
         # main.py expects a dict back from every agent. nan means "no score yet";
-        # returning 0 would look like a real score of zero.
-    return {"default": float("nan")}
+
+    # --- optimizer and train state ------------------------------------------
+    tx = optax.adam(
+        learning_rate=config["LEARNING_RATE"],
+        b1=config["ADAM_B1"],
+        b2=config["ADAM_B2"],
+        eps=config["ADAM_EPS"],
+    )
+    agent_state = Agent57TrainState.create(
+        apply_fn=network.apply,
+        params=params,
+        target_params=jax.tree.map(jnp.copy, params),
+        tx=tx,
+    )
+    loss_fn = partial(r2d2_loss, network=network, cfg=config)
+
+    # --- one learner step ----------------------------------------------------
+    def update(agent_state, buffer_state, rng):
+        """Sample 64 sequences, take one gradient step, write priorities back."""
+        batch = replay_buffer.sample(buffer_state, rng)
+        (loss, (priorities, q_mean)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+            agent_state.params,
+            agent_state.target_params,
+            batch.experience,
+            batch.probabilities,
+        )
+        agent_state = agent_state.apply_gradients(grads=grads)
+        buffer_state = replay_buffer.set_priorities(buffer_state, batch.indices, priorities)
+
+        # [R2D2] target <- online every 2500 LEARNER steps (apply_gradients counts them)
+        sync = (agent_state.step % config["TARGET_NETWORK_FREQUENCY"]) == 0
+        target_params = jax.lax.cond(
+            sync,
+            lambda _: optax.incremental_update(agent_state.params, agent_state.target_params, 1.0),
+            lambda _: agent_state.target_params,
+            operand=None,
+        )
+        return agent_state.replace(target_params=target_params), buffer_state, loss, q_mean
+
+    # --- play TRAIN_FREQUENCY steps, then learn once the buffer is warm ------
+    def train_step(carry, _):
+        agent_state, buffer_state, act_state, rng = carry
+        rng, collect_rng, update_rng = jax.random.split(rng, 3)
+
+        act_state, traj, infos = collect(agent_state.params, act_state, collect_rng)
+        buffer_state = replay_buffer.add(buffer_state, traj)
+
+        agent_state, buffer_state, loss, q_mean = jax.lax.cond(
+            replay_buffer.can_sample(buffer_state),
+            lambda a, b: update(a, b, update_rng),
+            lambda a, b: (a, b, jnp.float32(0.0), jnp.float32(0.0)),
+            agent_state,
+            buffer_state,
+        )
+        return (agent_state, buffer_state, act_state, rng), (infos, loss, q_mean)
+
+    @jax.jit
+    def scanned_steps(carry):
+        return jax.lax.scan(train_step, carry, None, length=config["SCAN_STEPS"])
+
+    # --- training loop -------------------------------------------------------
+    run_name = f"{config['ENV_ID']}_{config.get('EXP_NAME', 'agent57')}_{stage}_{'pixel' if config['PIXEL_BASED'] else 'oc'}_{config['SEED']}"
+    wandb.init(
+        project=config.get("PROJECT", "jaxtari-blines"),
+        entity=config.get("ENTITY", None),
+        config=config,
+        name=run_name,
+        save_code=True,
+    )
+    wandb.define_metric("*", step_metric="charts/global_step")
+
+    steps_per_iteration = num_envs * steps_per_call * config["SCAN_STEPS"]
+    carry = (agent_state, buffer_state, act_state, key)
+
+    print(f"[agent57] compiling ({config['SCAN_STEPS']} scan steps)...")
+    compile_start = time.perf_counter()
+    _ = jax.block_until_ready(scanned_steps(carry))
+    print(f"[agent57] compile time: {time.perf_counter() - compile_start:.1f}s")
+
+    rtpt = RTPT(
+        name_initials=config["NAME_INITIALS"],
+        experiment_name=run_name,
+        max_iterations=max(1, config["TOTAL_TIMESTEPS"] // steps_per_iteration),
+    )
+    rtpt.start()
+
+    global_step, avg_return = 0, float("nan")
+    run_start = time.perf_counter()
+    print(f"[agent57] training for {config['TOTAL_TIMESTEPS']} steps...")
+    while global_step < config["TOTAL_TIMESTEPS"]:
+        rtpt.step()
+        iteration_start = time.perf_counter()
+        carry, (infos, loss, q_mean) = jax.block_until_ready(scanned_steps(carry))
+        global_step = int(carry[2][-1])
+
+        avg_return = float(infos["returned_episode_returns"][-1].mean())
+        avg_length = float(infos["returned_episode_lengths"][-1].mean())
+        td_loss, q_val = float(loss[-1]), float(q_mean[-1])
+        sps = int(steps_per_iteration / (time.perf_counter() - iteration_start))
+        print(
+            f"[agent57] step {global_step} | return {avg_return:.2f} | length {avg_length:.0f} "
+            f"| loss {td_loss:.4f} | q {q_val:.3f} | SPS {sps} "
+            f"| total SPS {int(global_step / (time.perf_counter() - run_start))}"
+        )
+        wandb.log(
+            {
+                "charts/avg_episodic_return": avg_return,
+                "charts/avg_episodic_length": avg_length,
+                "losses/td_loss": td_loss,
+                "losses/q_values": q_val,
+                "charts/SPS": sps,
+                "charts/global_step": global_step,
+            },
+            step=global_step,
+        )
+
+    wandb.finish()
+    return {"default": avg_return}
