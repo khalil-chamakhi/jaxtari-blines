@@ -42,7 +42,7 @@ from jaxatari.wrappers import (
     LogWrapper,
     FlattenObservationWrapper
 )
-# from agents.agent57.agent57_eval import evaluate   # TODO: enable once eval is written
+from agents.agent57.agent57_eval import evaluate   
 from rtpt import RTPT
 def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False):
     assert mods is None or isinstance(mods, list), "mods must be None or a list of strings"
@@ -571,5 +571,42 @@ def single_run(config:dict):
             step=global_step,
         )
 
+    # --- save and evaluate ---------------------------------------------------
+    # Training returns use clipped rewards; this is the unclipped number, the one
+    # comparable to the DQN / Rainbow eval results.
+    model_path = (
+        f'{config.get("SAVE_PATH", "./models")}/{run_name}/'
+        f'{config["EXP_NAME"]}_{global_step}_{int(time.time())}.cleanrl_model'
+    )
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    with open(model_path, "wb") as f:
+        f.write(flax.serialization.to_bytes([config, carry[0].params]))
+    print(f"[agent57] model saved to {model_path}")
+
+    episodic_returns, _ = evaluate(
+        model_path,
+        partial(
+            make_env,
+            mods=list(config.get("TRAIN_MODS", [])),
+            pixel_based=config["PIXEL_BASED"],
+            native_downscaling=config.get("NATIVE_DOWNSCALING", True),
+            eval=True,
+        ),
+        config["ENV_ID"],
+        eval_episodes=config.get("EVAL_EPISODES", 10),
+        Model=RecurrentQNetwork,
+        network_kwargs=dict(
+            pixel_based=config["PIXEL_BASED"],
+            hidden_size=hidden,
+            dueling_units=config["DUELING_UNITS"],
+            mlp_width=config.get("MLP_WIDTH", 512),
+            mlp_depth=config.get("MLP_DEPTH", 2),
+        ),
+        seed=config["SEED"] + 42,
+    )
+    eval_return = float(jnp.mean(episodic_returns))
+    print(f"[agent57] eval return {eval_return:.2f} (train return {avg_return:.2f})")
+    wandb.log({"eval/episodic_return": eval_return}, step=global_step)
+
     wandb.finish()
-    return {"default": avg_return}
+    return {"default": eval_return}
