@@ -171,7 +171,93 @@ class RecurrentQNetwork(nn.Module):
             jax.random.PRNGKey(0), (batch_size, hidden_size)
         )
 
+# ---- NGU: controllable-state embedding ---------------------------------------
+class EmbeddingNet(nn.Module):
+    """Observation -> controllable-state embedding.
+ 
+    [NGU] the embedding is 32-dimensional on Atari, on top of the same torso the
+    Q-network uses. Kept linear at the output: these vectors are compared with
+    euclidean distances in the episodic memory, and a ReLU would fold half the
+    space onto zero.
+    """
+    pixel_based: bool
+    embedding_dim: int = 32
+    mlp_width: int = 512
+    mlp_depth: int = 2
+ 
+    @nn.compact
+    def __call__(self, obs):
+        x = Torso(
+            pixel_based=self.pixel_based,
+            mlp_width=self.mlp_width,
+            mlp_depth=self.mlp_depth,
+        )(obs)
+        return nn.Dense(self.embedding_dim)(x)
 
+
+class InverseDynamics(nn.Module):
+    """(embedding_t, embedding_t+1) -> logits over actions.
+ 
+    [NGU] one hidden layer of 128 units on the concatenated pair. Exists only to
+    train EmbeddingNet; nothing downstream uses these logits.
+    """
+    action_dim: int
+    hidden: int = 128
+ 
+    @nn.compact
+    def __call__(self, emb_t, emb_next):
+        x = jnp.concatenate([emb_t, emb_next], axis=-1)
+        x = nn.relu(nn.Dense(self.hidden)(x))
+        return nn.Dense(self.action_dim)(x)
+
+class EmbeddingTrainer(nn.Module):
+    """EmbeddingNet + InverseDynamics under one set of parameters.
+ 
+    Flax modules own their submodules, so training both halves together needs
+    them in one module. `embed` is what the episodic memory calls later.
+    """
+    action_dim: int
+    pixel_based: bool
+    embedding_dim: int = 32
+    hidden: int = 128
+    mlp_width: int = 512
+    mlp_depth: int = 2
+ 
+    def setup(self):
+        self.embedding = EmbeddingNet(
+            pixel_based=self.pixel_based,
+            embedding_dim=self.embedding_dim,
+            mlp_width=self.mlp_width,
+            mlp_depth=self.mlp_depth,
+        )
+        self.classifier = InverseDynamics(action_dim=self.action_dim, hidden=self.hidden)
+ 
+    def __call__(self, obs, next_obs):
+        """Training path: both observations in, action logits out."""
+        return self.classifier(self.embedding(obs), self.embedding(next_obs))
+ 
+    def embed(self, obs):
+        """Inference path: the 32-d embedding the episodic memory compares."""
+        return self.embedding(obs)
+
+def embedding_loss(params, obs, next_obs, actions, model):
+    """[NGU] maximum likelihood of the action actually taken.
+ 
+    obs, next_obs: (B, *obs_shape)   consecutive observations
+    actions:       (B,) int32        the action taken between them
+    model:         the EmbeddingTrainer; last, so it can be fixed  the same way r2d2_loss fixes `network`
+ 
+    Returns the cross-entropy loss and the accuracy. Accuracy is the number to
+    watch: at chance level (1/action_dim) the embedding has learned nothing, and
+    novelty computed from it would be meaningless.
+    """
+    logits = model.apply(params, obs, next_obs)
+    log_probs = jax.nn.log_softmax(logits)
+    chosen = jnp.take_along_axis(log_probs, actions[:, None], axis=-1)[..., 0]
+    loss = -jnp.mean(chosen)
+    accuracy = jnp.mean(jnp.argmax(logits, axis=-1) == actions)
+    return loss, accuracy
+ 
 
 class Agent57TrainState(TrainState):
     target_params: flax.core.FrozenDict
