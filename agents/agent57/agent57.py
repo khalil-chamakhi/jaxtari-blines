@@ -257,6 +257,187 @@ def embedding_loss(params, obs, next_obs, actions, model):
     loss = -jnp.mean(chosen)
     accuracy = jnp.mean(jnp.argmax(logits, axis=-1) == actions)
     return loss, accuracy
+# ---- NGU: intrinsic reward ---------------------------------------------------
+#The intrinsic reward multiplies two novelty signals: r_i = r_episodic * min(max(alpha, 1), L)
+#r_episodic      k-NN over the embeddings seen so far in this episode.
+#   alpha        RND prediction error, normalised. Only ever scales r_episodic up (clipped to [1, L]).
+#
+# The agent then learns on r = r_e + beta * r_i, where beta depends on the arm.
+
+@flax.struct.dataclass
+class EpisodicMemory:
+    """One fixed-size ring buffer of embeddings per env.
+    The memory is a preallocated array plus a count of
+    valid entries and a write pointer.
+    """
+    embeddings: jnp.ndarray    
+    count: jnp.ndarray        
+    write: jnp.ndarray        
+    dist_mean: jnp.ndarray     
+    dist_n: jnp.ndarray        
+
+def init_episodic_memory(num_envs, size, dim):
+    return EpisodicMemory(
+        embeddings=jnp.zeros((num_envs, size, dim), jnp.float32),
+        count=jnp.zeros((num_envs,), jnp.int32),
+        write=jnp.zeros((num_envs,), jnp.int32),
+        dist_mean=jnp.array(1.0, jnp.float32),
+        dist_n=jnp.array(0.0, jnp.float32),
+    )
+def episodic_reward(memory, embedding, first, cfg):
+    """[NGU] Algorithm 1: episodic novelty of `embedding`, then store it.
+ 
+    memory:    EpisodicMemory
+    embedding: (E, D) controllable-state embedding of the current observation
+    first:     (E,) bool, True on the first step of an episode (prev_action < 0).
+    That env's memory is wiped before it is queried.
+    Returns (reward (E,), updated memory).
+    """
+    k = min(cfg["NUM_NEIGHBOURS"], memory.embeddings.shape[1])
+    eps = cfg["KERNEL_EPSILON"]
+    xi = cfg["CLUSTER_DISTANCE"]
+    c = cfg["PSEUDO_COUNT_C"]
+    s_max = cfg["MAX_SIMILARITY"]
+ 
+    # a new episode starts with an empty memory
+    count = jnp.where(first, 0, memory.count)
+    write = jnp.where(first, 0, memory.write)
+ 
+    # 1. squared distance to every slot
+    size = memory.embeddings.shape[1]
+    d2 = jnp.sum(jnp.square(memory.embeddings - embedding[:, None, :]), axis=-1)   
+    valid_slot = jnp.arange(size)[None, :] < count[:, None]
+    d2 = jnp.where(valid_slot, d2, jnp.inf)
+ 
+    # 2. the k nearest
+    neg_nn, _ = jax.lax.top_k(-d2, k)
+    nn_d2 = -neg_nn                                   # (E, k), inf where fewer than k exist
+    valid_nn = jnp.isfinite(nn_d2)
+ 
+    # 3. update the running mean of squared k-NN distances, then normalise it
+    n_new = jnp.sum(valid_nn)
+    sum_new = jnp.sum(jnp.where(valid_nn, nn_d2, 0.0))
+    total = memory.dist_n + n_new
+    dist_mean = jnp.where(
+        n_new > 0,
+        (memory.dist_mean * memory.dist_n + sum_new) / jnp.maximum(total, 1.0),
+        memory.dist_mean,
+    )
+    d_n = nn_d2 / jnp.maximum(dist_mean, 1e-8)
+ 
+    # 4. treat very close states as the same state
+    d_n = jnp.maximum(d_n - xi, 0.0)
+ 
+    # 5. kernel: 1 for an identical state, falling towards 0 with distance
+    kernel = jnp.where(valid_nn, eps / (d_n + eps), 0.0)
+ 
+    # 6. sum(kernel) is a soft visit count n, so the reward is the count-based
+    #    bonus 1/sqrt(n)
+    #    Note: each kernel value is at most 1 
+
+    s = jnp.sqrt(jnp.sum(kernel, axis=-1)) + c
+    reward = jnp.where(s > s_max, 0.0, 1.0 / s)
+ 
+    # Implementation choice, not in the paper: an empty memory would give
+    # s = c and a reward of 1/c = 1000 on every episode's first step, which would
+    # dominate everything else. Return 0 until there is something to compare to.
+    reward = jnp.where(count > 0, reward, 0.0)
+ 
+    # 7. store the embedding in the ring buffer
+    embeddings = jax.vmap(lambda m, w, x: m.at[w].set(x))(memory.embeddings, write, embedding)
+    new_memory = EpisodicMemory(
+        embeddings=embeddings,
+        count=jnp.minimum(count + 1, size),
+        write=(write + 1) % size,
+        dist_mean=dist_mean,
+        dist_n=total,
+    )
+    return reward, new_memory
+
+# ---- NGU: lifelong novelty (RND) ---------------------------------------------
+# A target network is initialised randomly and never trained; a predictor learns to copy its output. Where the predictor is still wrong, the state has rarely been
+# seen during training. Unlike the episodic memory, this never resets.
+ 
+ 
+class RNDNetwork(nn.Module):
+    """Observation -> feature vector. Used twice: frozen target, trained predictor.
+    """
+    pixel_based: bool
+    output_dim: int = 128
+    mlp_width: int = 512
+    mlp_depth: int = 2
+ 
+    @nn.compact
+    def __call__(self, obs):
+        x = Torso(pixel_based=self.pixel_based, mlp_width=self.mlp_width, mlp_depth=self.mlp_depth)(obs)
+        return nn.Dense(self.output_dim)(x)
+ 
+ 
+def rnd_error(predictor_params, target_params, network, obs):
+    """Per-observation squared prediction error, shape (B,)."""
+    pred = network.apply(predictor_params, obs)
+    target = jax.lax.stop_gradient(network.apply(target_params, obs))
+    return jnp.mean(jnp.square(pred - target), axis=-1)
+ 
+ 
+def rnd_loss(predictor_params, target_params, obs, network):
+    """Train the predictor to copy the frozen target. `network` last for partial()."""
+    return jnp.mean(rnd_error(predictor_params, target_params, network, obs))
+ 
+ 
+@flax.struct.dataclass
+class RunningStats:
+    """Running mean and variance, updated a batch at a time (Chan et al.)."""
+    mean: jnp.ndarray
+    var: jnp.ndarray
+    count: jnp.ndarray
+ 
+ 
+def init_running_stats():
+    return RunningStats(mean=jnp.array(0.0), var=jnp.array(1.0), count=jnp.array(1e-4))
+ 
+ 
+def update_running_stats(stats, x):
+    batch_mean, batch_var, n = jnp.mean(x), jnp.var(x), x.size
+    delta = batch_mean - stats.mean
+    total = stats.count + n
+    mean = stats.mean + delta * n / total
+    m2 = stats.var * stats.count + batch_var * n + jnp.square(delta) * stats.count * n / total
+    return RunningStats(mean=mean, var=m2 / total, count=total)
+ 
+ 
+def rnd_modulator(error, stats, cfg):
+    """[NGU] alpha = 1 + (err - mean) / std, clipped to [1, L].
+ 
+    Clipping below at 1 means a familiar state never REDUCES the episodic reward;
+    lifelong novelty can only amplify it, by at most L = 5.
+    """
+    alpha = 1.0 + (error - stats.mean) / jnp.sqrt(stats.var + 1e-8)
+    return jnp.clip(alpha, 1.0, cfg["INTRINSIC_CLIP_L"])
+ 
+ 
+def intrinsic_reward(r_episodic, modulator):
+    """[NGU] r_i = r_episodic * min(max(alpha, 1), L)."""
+    return r_episodic * modulator
+ 
+ 
+def mixed_reward(r_extrinsic, r_intrinsic, beta):
+    """[NGU] the reward an arm learns from: r = r_e + beta * r_i.
+ 
+    beta = 0 is the purely exploitative arm; with r_i present but beta = 0 the
+    agent must behave exactly like plain R2D2, which is stage 2's gate.
+    """
+    return r_extrinsic + beta * r_intrinsic
+
+
+
+
+ 
+    
+
+
+
+
  
 
 class Agent57TrainState(TrainState):
@@ -519,11 +700,6 @@ def single_run(config:dict):
         # scan stacks time first (T, num_envs, ...); the buffer wants (num_envs, T, ...)
         traj = jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), traj)
         return act_state, traj, infos
-    @partial(jax.jit, donate_argnums=(2,))
-    def collect_and_store(params, act_state, buffer_state, rng):
-        act_state, traj, infos = collect(params, act_state, rng)
-        buffer_state = replay_buffer.add(buffer_state, traj)
-        return act_state, buffer_state, infos
     
     key, reset_key = jax.random.split(key)
     obs, env_state = vmap_reset(jax.random.split(reset_key, num_envs))
@@ -607,7 +783,7 @@ def single_run(config:dict):
         project=config.get("PROJECT", "jaxtari-blines"),
         entity=config.get("ENTITY", None),
         config=config,
-        name=run_name,
+        name=run_name, 
         save_code=True,
     )
     wandb.define_metric("*", step_metric="charts/global_step")
