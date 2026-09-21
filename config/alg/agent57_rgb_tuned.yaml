@@ -1,3 +1,7 @@
+# agent57_rgb_tuned: the settings every reported run actually used.
+# Copied from agent57_rgb_original.yaml; only the [ours] lines below differ.
+# TOTAL_TIMESTEPS stays 10M; the 2M games override it on the command line.
+#
 # Agent57 — pixel-based observations.
 #
 # Provenance of each value:
@@ -18,21 +22,21 @@ PIXEL_BASED: True
 NATIVE_DOWNSCALING: True
 
 TOTAL_TIMESTEPS: 10000000
-BUFFER_SIZE: 100000              # ~2.8 GB. Matches dqn_rgb / rainbow_rgb, which both comment out the 1e6 line for the same reason.
-LEARNING_STARTS: 80000
+BUFFER_SIZE: 50000               # [ours] 11 GB VRAM: 28 KB obs + 4 KB LSTM state per step
+LEARNING_STARTS: 40000           # [ours] kept at 80% of the buffer, as in the baselines
 TARGET_NETWORK_FREQUENCY: 2500   # [R2D2] counts LEARNER steps, not env steps
-SCAN_STEPS: 1000
+SCAN_STEPS: 64                   # [ours] 8 envs x 4 steps x 64 = one log line per ~2k env steps
 GRADIENT_STEPS: 1                # -1 == n_envs * train_freq
 
-NUM_ENVS: 1
+NUM_ENVS: 8                      # [ours] throughput; replay ratio ~80 vs DQN's ~8
 LEARNING_RATE: 1e-4              
 ADAM_EPS: 1e-3                   
 ADAM_B1: 0.9                     # [R2D2] same as optax's default — listed
 ADAM_B2: 0.999                   #  explicitly so the config is a complete record of the paper's optimiser settings. Must be passed to optax.adam in single_run, dqn/rainbow don't pass betas at all.
 
-BATCH_SIZE: 64                   # [R2D2] 64 SEQUENCES, not transitions: 64 x 80 = 5120 transitions per update vs DQN's 32. Note this in the report.
+BATCH_SIZE: 32                   # [ours] fits 11 GB with 120-step pixel sequences
 TRAIN_FREQUENCY: 4
-GAMMA: 0.997                     # [R2D2] Table 2
+GAMMA: 0.99                      # same as dqn. R2D2 uses 0.997 -> report adaptation
 TAU: 1.0
 # --- sequence replay  ------------------------
 
@@ -59,3 +63,12 @@ DUELING_UNITS: 512              # [R2D2] each of the V and A heads
 START_E: 1.0                     # same as dqn: linear 1.0 -> 0.01
 END_E: 0.01                      #   over the first 10% of TOTAL_TIMESTEPS.
 EXPLORATION_FRACTION: 0.10       #   R2D2 uses its own epsilon scheme -> report adaptation
+
+# --- NGU (stage 2) ---------------------------------------------------------
+EPISODIC_MEMORY_SIZE: 2048      # [ours] paper 30000; k-NN is O(M) per env step
+NUM_NEIGHBOURS: 10              # [NGU] Table 6
+KERNEL_EPSILON: 0.0001          # [NGU] Table 6 (section 2 text says 1e-3)
+CLUSTER_DISTANCE: 0.008         # [NGU] Table 6
+PSEUDO_COUNT_C: 0.001           # [NGU] Table 6
+MAX_SIMILARITY: 8.0             # [NGU] Table 6; cannot trigger with k = 10
+INTRINSIC_CLIP_L: 5.0           # [NGU] Table 6
