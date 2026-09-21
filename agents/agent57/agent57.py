@@ -135,19 +135,30 @@ class RecurrentQNetwork(nn.Module):
     dueling_units: int = 512
     mlp_width: int = 512
     mlp_depth: int = 2
+    num_arms: int = 0   
 
     @nn.compact
-    def __call__(self, carry, obs, prev_action, prev_reward):
+    def __call__(self, carry, obs, prev_action, prev_reward, arm=None, prev_intrinsic=None):
         first = (prev_action < 0)[:, None]
         carry = jax.tree.map(lambda c: jnp.where(first, 0.0, c), carry)
         x = Torso(pixel_based=self.pixel_based,mlp_width=self.mlp_width,mlp_depth=self.mlp_depth)(obs)
-
         # [R2D2] the LSTM input carries the previous action and reward.
-        x = jnp.concatenate([
+        inputs = [
             x,
             jax.nn.one_hot(prev_action, self.action_dim),
             prev_reward[:, None],
-        ], axis=-1)
+        ]
+        # [NGU] the network is also told which arm it is playing as, and the
+        # curiosity reward from the last step. That is how one set of weights
+        # can play all arms. Decided in Python before jit: with num_arms = 0
+        # these inputs do not exist and the network is exactly stage 1.
+        
+        if self.num_arms > 0:
+            inputs += [
+                jax.nn.one_hot(arm, self.num_arms),
+                prev_intrinsic[:, None],
+            ]
+        x = jnp.concatenate(inputs, axis=-1)
 
         carry, x = nn.OptimizedLSTMCell(self.hidden_size)(carry, x)
 
@@ -160,7 +171,6 @@ class RecurrentQNetwork(nn.Module):
         a = nn.Dense(self.dueling_units)(x)
         a = nn.relu(a)
         a = nn.Dense(self.action_dim)(a)
-
         q = v + (a - a.mean(axis=-1, keepdims=True))
         return carry, q
 
@@ -428,6 +438,38 @@ def mixed_reward(r_extrinsic, r_intrinsic, beta):
     agent must behave exactly like plain R2D2, which is stage 2's gate.
     """
     return r_extrinsic + beta * r_intrinsic
+
+# ---- NGU: policy family (arms) -----------------------------------------------
+# NGU uses several policies, called arms, that share one network.
+#
+# Each arm differs by:
+#   beta   weight of intrinsic reward
+#   gamma  planning horizon
+#
+# arm 0:     beta = 0,        gamma = gamma_max  -> exploit
+# arm N - 1: beta = beta_max, gamma = gamma_min  -> explore
+#
+# Intermediate beta values follow a sigmoid schedule:
+#
+#   beta_j = beta_max * sigmoid(10 * (2*j - (N - 2)) / (N - 2))
+#
+# with beta_0 = 0 and beta_{N-1} = beta_max.
+# This places more arms near low and high curiosity, and fewer in the middle.
+ 
+ 
+def arm_schedule(num_arms, beta_max, gamma_max, gamma_min):
+    """[NGU] beta_j and gamma_j for every arm. Returns two (num_arms,) arrays."""
+    j = jnp.arange(num_arms, dtype=jnp.float32)
+    n = num_arms
+ 
+    # beta: 0 for arm 0, beta_max for the last arm, sigmoid in between
+    inner = beta_max * jax.nn.sigmoid(10.0 * (2.0 * j - (n - 2)) / (n - 2))
+    betas = jnp.where(j == 0, 0.0, jnp.where(j == n - 1, beta_max, inner))
+ 
+    # gamma: interpolate log(1 - gamma) linearly between the two ends
+    log_1mg = ((n - 1 - j) * jnp.log(1.0 - gamma_max) + j * jnp.log(1.0 - gamma_min)) / (n - 1)
+    gammas = 1.0 - jnp.exp(log_1mg)
+    return betas, gammas
 
 
 
