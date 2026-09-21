@@ -72,3 +72,8 @@ CLUSTER_DISTANCE: 0.008         # [NGU] Table 6
 PSEUDO_COUNT_C: 0.001           # [NGU] Table 6
 MAX_SIMILARITY: 8.0             # [NGU] Table 6; cannot trigger with k = 10
 INTRINSIC_CLIP_L: 5.0           # [NGU] Table 6
+# --- NGU arms ----------------------------------------------------------------
+NUM_ARMS: 8                     # [ours] paper 32; one per env with NUM_ENVS=8
+BETA_MAX: 0.3                   # [NGU]
+GAMMA_MAX: 0.99                 # [ours] paper 0.997; equals GAMMA so arm 0 matches the R2D2 runs
+GAMMA_MIN: 0.98                 # [ours] paper 0.99; shifted down to keep the horizon spread

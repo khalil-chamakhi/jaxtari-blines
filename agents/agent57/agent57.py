@@ -152,7 +152,7 @@ class RecurrentQNetwork(nn.Module):
         # curiosity reward from the last step. That is how one set of weights
         # can play all arms. Decided in Python before jit: with num_arms = 0
         # these inputs do not exist and the network is exactly stage 1.
-        
+
         if self.num_arms > 0:
             inputs += [
                 jax.nn.one_hot(arm, self.num_arms),
@@ -250,7 +250,7 @@ class EmbeddingTrainer(nn.Module):
         """Inference path: the 32-d embedding the episodic memory compares."""
         return self.embedding(obs)
 
-def embedding_loss(params, obs, next_obs, actions, model):
+def embedding_loss(params, obs, next_obs, actions, model, mask=None):
     """[NGU] maximum likelihood of the action actually taken.
  
     obs, next_obs: (B, *obs_shape)   consecutive observations
@@ -264,9 +264,15 @@ def embedding_loss(params, obs, next_obs, actions, model):
     logits = model.apply(params, obs, next_obs)
     log_probs = jax.nn.log_softmax(logits)
     chosen = jnp.take_along_axis(log_probs, actions[:, None], axis=-1)[..., 0]
-    loss = -jnp.mean(chosen)
-    accuracy = jnp.mean(jnp.argmax(logits, axis=-1) == actions)
+    # mask: 1 for a real (obs, next_obs) pair, 0 where next_obs already belongs to
+    # the next episode; there the action says nothing about the change.
+    if mask is None:
+        mask = jnp.ones_like(chosen)
+    denom = jnp.maximum(mask.sum(), 1.0)
+    loss = -jnp.sum(chosen * mask) / denom
+    accuracy = jnp.sum((jnp.argmax(logits, axis=-1) == actions) * mask) / denom
     return loss, accuracy
+
 # ---- NGU: intrinsic reward ---------------------------------------------------
 #The intrinsic reward multiplies two novelty signals: r_i = r_episodic * min(max(alpha, 1), L)
 #r_episodic      k-NN over the embeddings seen so far in this episode.
@@ -502,6 +508,7 @@ class TimeStep:
 
     arm: jnp.ndarray            # which of the 8 (beta, gamma) policies acted
     intrinsic_reward: jnp.ndarray   # curiosity reward for this step
+    prev_intrinsic: jnp.ndarray     # [NGU] curiosity reward of the previous step; a network input, stored for the same reason as prev_reward
 
 
 #---- R2D2 loss ---------------------------------------------------------------
@@ -532,15 +539,18 @@ def n_step_targets(rewards, discounts,bootstrap , n ):
         g= rewards[i:i+t] + discounts[i:i+t] * g
     return g
         
-
 def unroll(network, params, carry, seq):
     """Run the network over a time-first sequence. Returns (last carry, q of shape (T, B, A))."""
     def step(carry, x):
-        obs, prev_action, prev_reward = x
-        return network.apply(params, carry, obs, prev_action, prev_reward)
-    return jax.lax.scan(step, carry, (seq.obs, seq.prev_action, seq.prev_reward))
+        return network.apply(params, carry, *x)
 
-def r2d2_loss(params, target_params, batch , probabilities, network, cfg):
+    xs = (seq.obs, seq.prev_action, seq.prev_reward)
+    if network.num_arms > 0:
+        # [NGU] the arm and the previous curiosity reward are network inputs too
+        xs = xs + (seq.arm, seq.prev_intrinsic)
+    return jax.lax.scan(step, carry, xs)
+
+def r2d2_loss(params, target_params, batch , probabilities, network, cfg, arm_betas=None, arm_gammas=None):
     """batch: TimeStep with arrays shaped (B, BURN_IN + SEQ_LEN, ...).
     probabilities: (B,) sampling probabilities from the prioritised buffer.
     Returns loss and (new priorities (B,), mean Q of taken actions)."""
@@ -568,7 +578,16 @@ def r2d2_loss(params, target_params, batch , probabilities, network, cfg):
  
     # 4. n-step target, computed in real-return space, then squashed with h
     rewards = learn.reward[:-1]
-    discounts = cfg["GAMMA"] * (1.0 - learn.done[:-1].astype(jnp.float32))
+    gamma = cfg["GAMMA"]
+    if arm_betas is not None:
+        # [NGU] each step learns from its own arm's reward mix and discount:
+        # r = r_e + beta_arm * r_i, gamma = gamma_arm. Arm 0 has beta = 0 and
+        # gamma = GAMMA, so it learns exactly what stage 1 learns.
+        arm = learn.arm[:-1]
+        rewards = mixed_reward(rewards, learn.intrinsic_reward[:-1], arm_betas[arm])
+        gamma = arm_gammas[arm]
+
+    discounts = gamma * (1.0 - learn.done[:-1].astype(jnp.float32))
     returns = n_step_targets(rewards, discounts, h_inv(next_value, eps), cfg["N_STEP"])
     target = jax.lax.stop_gradient(h(returns, eps))
  
@@ -601,6 +620,8 @@ def single_run(config:dict):
     config = {k.upper(): v for k, v in config.items() if k != "alg"}
     stage = config.get("STAGE", "r2d2")
     assert stage in ("r2d2", "ngu", "split_q", "agent57"), f"unknown STAGE: {stage}"
+    assert stage in ("r2d2", "ngu"), f"STAGE={stage} is not implemented yet"
+    ngu = stage == "ngu"
 
    # do not modify the seeding
     random.seed(config["SEED"])
@@ -637,6 +658,8 @@ def single_run(config:dict):
     obs_bytes = int(np.prod(obs_shape)) * (1 if config["PIXEL_BASED"] else 4)
     carry_bytes = 2 * hidden * 4
     buffer_gb = config["BUFFER_SIZE"] * (obs_bytes + carry_bytes) / 1e9
+
+
     # --- env helpers (copied from dqn.py) -----------------------------------
     @jax.jit
     def vmap_reset(rng):
@@ -649,6 +672,8 @@ def single_run(config:dict):
         next_done = jnp.logical_or(terminated, truncated)
         return next_obs.reshape(action.shape[0], *obs_shape), state, reward, next_done, info
 
+
+
     # --- network ------------------------------------------------------------
 
     network = RecurrentQNetwork(
@@ -658,7 +683,10 @@ def single_run(config:dict):
         dueling_units=config["DUELING_UNITS"],
         mlp_width=config.get("MLP_WIDTH", 512),
         mlp_depth=config.get("MLP_DEPTH", 2),
+        num_arms=config["NUM_ARMS"] if ngu else 0,
+
     )
+    ngu_inputs = lambda n: (jnp.zeros((n,), jnp.int32), jnp.zeros((n,), jnp.float32)) if ngu else ()
     key, reset_key, net_key = jax.random.split(key, 3)
     dummy_obs, _ = env.reset(reset_key)
     dummy_obs = dummy_obs.reshape(obs_shape)
@@ -668,6 +696,8 @@ def single_run(config:dict):
         dummy_obs[None],
         jnp.zeros((1,), jnp.int32),
         jnp.zeros((1,), jnp.float32),
+        *ngu_inputs(1),
+
     )
 
 
@@ -693,32 +723,84 @@ def single_run(config:dict):
         prev_reward=jnp.zeros((), dtype=jnp.float32), carry=jax.tree.map(lambda c: c[0], RecurrentQNetwork.initial_carry(1, hidden)),
         arm=jnp.zeros((), dtype=jnp.int32),
         intrinsic_reward=jnp.zeros((), dtype=jnp.float32),
+        prev_intrinsic=jnp.zeros((), dtype=jnp.float32),
     )
     buffer_state = replay_buffer.init(dummy_timestep)
-
+ # --- NGU: side networks and arms ------------------------------------------
+    # Stage 2 adds three things to stage 1, all created only when ngu is True:
+    #   arms        a fixed (beta, gamma) per env: env i plays arm i mod NUM_ARMS
+    #   embedding   observation -> 32-d controllable state, for episodic novelty
+    #   RND         frozen random target + trained predictor, for lifelong novelty
+    ngu_state = {}
+    if ngu:
+        arm_betas, arm_gammas = arm_schedule(
+            config["NUM_ARMS"], config["BETA_MAX"], config["GAMMA_MAX"], config["GAMMA_MIN"])
+        env_arms = jnp.arange(num_envs, dtype=jnp.int32) % config["NUM_ARMS"]
+        emb_model = EmbeddingTrainer(
+            action_dim=action_dim, pixel_based=config["PIXEL_BASED"],
+            embedding_dim=config.get("EMBEDDING_DIM", 32),
+            mlp_width=config.get("MLP_WIDTH", 512), mlp_depth=config.get("MLP_DEPTH", 2))
+        rnd_net = RNDNetwork(
+            pixel_based=config["PIXEL_BASED"], output_dim=config.get("RND_OUTPUT_DIM", 128),
+            mlp_width=config.get("MLP_WIDTH", 512), mlp_depth=config.get("MLP_DEPTH", 2))
+        key, k_emb, k_tgt, k_pred = jax.random.split(key, 4)
+        # [NGU] lr 5e-4 and Adam eps 1e-4 for both side networks; L2 1e-5 on the embedding
+        side_lr = config.get("NGU_LEARNING_RATE", 5e-4)
+        side_eps = config.get("NGU_ADAM_EPS", 1e-4)
+        ngu_state = {
+            "emb": TrainState.create(
+                apply_fn=emb_model.apply,
+                params=emb_model.init(k_emb, dummy_obs[None], dummy_obs[None]),
+                tx=optax.chain(optax.add_decayed_weights(config.get("EMBEDDING_L2", 1e-5)),
+                               optax.adam(side_lr, eps=side_eps))),
+            "rnd": TrainState.create(
+                apply_fn=rnd_net.apply,
+                params=rnd_net.init(k_pred, dummy_obs[None]),
+                tx=optax.adam(side_lr, eps=side_eps)),
+            "rnd_target": rnd_net.init(k_tgt, dummy_obs[None]),   # never trained
+        }
      # --- collection ---------------------------------------------------------
      # One call = TRAIN_FREQUENCY steps in every env. Unlike dqn, the whole chunk
      # goes into the buffer at once: the trajectory buffer keeps each env's steps
      # in order and cuts 120-step sequences out of them when sampling.
     total_timesteps = config["TOTAL_TIMESTEPS"]
     steps_per_call = config["TRAIN_FREQUENCY"]
-    def collect(params, act_state, rng):
+    def collect(params, act_state, rng, side=None):
         def act_step(act_state, rng):
-            env_state, obs, lstm, prev_action, prev_reward, global_step = act_state
+            env_state, obs, lstm, prev_action, prev_reward, ngu_act, global_step = act_state
             action_rng, explore_rng = jax.random.split(rng)
             # same schedule as dqn.py
             epsilon = jnp.interp(
                 global_step,
                 jnp.array([0, config["EXPLORATION_FRACTION"] * total_timesteps]),
-                jnp.array([config["START_E"], config["END_E"]]),)
+                jnp.array([config["START_E"], config["END_E"]]),
+            )
+            if ngu:
+                memory, prev_intrinsic, rnd_stats = ngu_act
+                net_extra = (env_arms, prev_intrinsic)
+            else:
+                net_extra = ()
 
-            next_lstm, q_values = network.apply(params, lstm, obs, prev_action, prev_reward)
+            
+
+            next_lstm, q_values = network.apply(params, lstm, obs, prev_action, prev_reward, *net_extra)
             greedy_actions = q_values.argmax(axis=-1)
             random_actions = jax.random.randint(action_rng, (num_envs,), 0, action_dim)
             explore_mask = jax.random.uniform(explore_rng, (num_envs,)) < epsilon
             actions = jnp.where(explore_mask, random_actions, greedy_actions)
             next_obs, env_state, rewards, next_done, info = vmap_step(env_state, actions)
             rewards = rewards.astype(jnp.float32)   # env clips to int32; the buffer and loss use float32
+            if ngu:
+                emb = emb_model.apply(side["emb"].params, next_obs, method=EmbeddingTrainer.embed)
+                r_episodic, memory = episodic_reward(memory, emb, next_done, config)
+                err = rnd_error(side["rnd"].params, side["rnd_target"], rnd_net, next_obs)
+                rnd_stats = update_running_stats(rnd_stats, err)
+                r_int = intrinsic_reward(r_episodic, rnd_modulator(err, rnd_stats, config))
+                arm_used, prev_int_used = env_arms, prev_intrinsic
+            else:
+                r_int = jnp.zeros_like(rewards)
+                arm_used, prev_int_used = jnp.zeros_like(actions), jnp.zeros_like(rewards)
+            
             timestep = TimeStep(
                 obs=obs,
                 action=actions,
@@ -727,14 +809,20 @@ def single_run(config:dict):
                 prev_action=prev_action,
                 prev_reward=prev_reward,
                 carry=lstm,                          # state BEFORE this step
-                arm=jnp.zeros_like(actions),         # NGU fields, unused in r2d2
-                 intrinsic_reward=jnp.zeros_like(rewards),
+                arm=arm_used,        
+                intrinsic_reward=r_int,
+                prev_intrinsic=prev_int_used,
+
             )
             # Inputs for the next step. Where the episode just ended, -1 tells
             # the network to start from a zero carry.
             prev_action = jnp.where(next_done, -1, actions)
             prev_reward = jnp.where(next_done, 0.0, rewards)
-            act_state = (env_state, next_obs, next_lstm, prev_action, prev_reward, global_step + num_envs)
+            if ngu:
+                # like prev_reward: a new episode starts from 0
+                ngu_act = (memory, jnp.where(next_done, 0.0, r_int), rnd_stats)
+
+            act_state = (env_state, next_obs, next_lstm, prev_action, prev_reward, ngu_act, global_step + num_envs)
             return act_state, (timestep, info)
         
         rngs = jax.random.split(rng, steps_per_call)
@@ -751,6 +839,9 @@ def single_run(config:dict):
         RecurrentQNetwork.initial_carry(num_envs, hidden),
         jnp.full((num_envs,), -1, jnp.int32),      # -1 = first step of an episode
         jnp.zeros((num_envs,), jnp.float32),
+        (init_episodic_memory(num_envs, config["EPISODIC_MEMORY_SIZE"], config.get("EMBEDDING_DIM", 32)),#
+        jnp.zeros((num_envs,), jnp.float32),      # previous intrinsic reward
+        init_running_stats()) if ngu else (),
         jnp.array(0, jnp.int32),                   # global_step, in env steps
     )
     print(f"[agent57] stage={stage} env={config['ENV_ID']} "f"{'pixel' if config['PIXEL_BASED'] else 'oc'}")
@@ -773,10 +864,26 @@ def single_run(config:dict):
         target_params=jax.tree.map(jnp.copy, params),
         tx=tx,
     )
-    loss_fn = partial(r2d2_loss, network=network, cfg=config)
+    loss_fn = partial(r2d2_loss, network=network, cfg=config,**({"arm_betas": arm_betas, "arm_gammas": arm_gammas} if ngu else {}))
+
+    side_frames = config.get("NGU_TRAIN_FRAMES", 5)   # [NGU] side networks train on the last 5 frames
 
     # --- one learner step ----------------------------------------------------
-    def update(agent_state, buffer_state, rng):
+    def update_side(side, exp):
+        """[NGU] one step for the embedding and RND predictor, on the last frames only."""
+        k = side_frames
+        obs_t = exp.obs[:, -(k + 1):-1].reshape((-1,) + obs_shape)
+        obs_tp1 = exp.obs[:, -k:].reshape((-1,) + obs_shape)
+        act_t = exp.action[:, -(k + 1):-1].reshape(-1)
+        valid = 1.0 - exp.done[:, -(k + 1):-1].reshape(-1).astype(jnp.float32)
+        (emb_l, emb_acc), g = jax.value_and_grad(embedding_loss, has_aux=True)(
+            side["emb"].params, obs_t, obs_tp1, act_t, emb_model, valid)
+        emb = side["emb"].apply_gradients(grads=g)
+        rnd_l, g = jax.value_and_grad(rnd_loss)(side["rnd"].params, side["rnd_target"], obs_tp1, rnd_net)
+        rnd = side["rnd"].apply_gradients(grads=g)
+        return {**side, "emb": emb, "rnd": rnd}, emb_acc, rnd_l
+
+    def update(agent_state, buffer_state, rng, side):
         """Sample 64 sequences, take one gradient step, write priorities back."""
         batch = replay_buffer.sample(buffer_state, rng)
         (loss, (priorities, q_mean)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
@@ -796,24 +903,33 @@ def single_run(config:dict):
             lambda _: agent_state.target_params,
             operand=None,
         )
-        return agent_state.replace(target_params=target_params), buffer_state, loss, q_mean
+        if ngu:
+            side, emb_acc, rnd_l = update_side(side, batch.experience)
+        else:
+            emb_acc, rnd_l = jnp.float32(0.0), jnp.float32(0.0) 
+            return agent_state.replace(target_params=target_params), buffer_state, loss, q_mean, side, emb_acc, rnd_l
+        return agent_state.replace(target_params=target_params), buffer_state, side, (loss, q_mean, emb_acc, rnd_l)
 
     # --- play TRAIN_FREQUENCY steps, then learn once the buffer is warm ------
     def train_step(carry, _):
-        agent_state, buffer_state, act_state, rng = carry
+        agent_state, buffer_state, act_state, rng, side= carry
         rng, collect_rng, update_rng = jax.random.split(rng, 3)
 
-        act_state, traj, infos = collect(agent_state.params, act_state, collect_rng)
+        act_state, traj, infos = collect(agent_state.params, act_state, collect_rng, side)
         buffer_state = replay_buffer.add(buffer_state, traj)
 
-        agent_state, buffer_state, loss, q_mean = jax.lax.cond(
+        zeros =(jnp.float32(0.0),) * 4
+        agent_state, buffer_state, side, metrics = jax.lax.cond(
             replay_buffer.can_sample(buffer_state),
-            lambda a, b: update(a, b, update_rng),
-            lambda a, b: (a, b, jnp.float32(0.0), jnp.float32(0.0)),
+            lambda a, b, s: update(a, b, update_rng, s),
+            lambda a, b, s: (a, b, s, zeros),
             agent_state,
             buffer_state,
+            side
         )
-        return (agent_state, buffer_state, act_state, rng), (infos, loss, q_mean)
+        r_int = traj.intrinsic_reward
+        metrics = metrics + (r_int.mean(), r_int.max())
+        return (agent_state, buffer_state, act_state, rng, side), (infos, metrics)
 
     @jax.jit
     def scanned_steps(carry):
@@ -831,7 +947,7 @@ def single_run(config:dict):
     wandb.define_metric("*", step_metric="charts/global_step")
 
     steps_per_iteration = num_envs * steps_per_call * config["SCAN_STEPS"]
-    carry = (agent_state, buffer_state, act_state, key)
+    carry = (agent_state, buffer_state, act_state, key, ngu_state)
 
     print(f"[agent57] compiling ({config['SCAN_STEPS']} scan steps)...")
     compile_start = time.perf_counter()
@@ -851,7 +967,8 @@ def single_run(config:dict):
     while global_step < config["TOTAL_TIMESTEPS"]:
         rtpt.step()
         iteration_start = time.perf_counter()
-        carry, (infos, loss, q_mean) = jax.block_until_ready(scanned_steps(carry))
+        carry, (infos, metrics) = jax.block_until_ready(scanned_steps(carry))
+        loss, q_mean, emb_acc, rnd_l, r_int_mean, r_int_max = metrics
         global_step = int(carry[2][-1])
 
         avg_return = float(infos["returned_episode_returns"][-1].mean())
@@ -860,8 +977,11 @@ def single_run(config:dict):
         sps = int(steps_per_iteration / (time.perf_counter() - iteration_start))
         print(
             f"[agent57] step {global_step} | return {avg_return:.2f} | length {avg_length:.0f} "
+
             f"| loss {td_loss:.4f} | q {q_val:.3f} | SPS {sps} "
             f"| total SPS {int(global_step / (time.perf_counter() - run_start))}"
+            + (f" | r_int {float(r_int_mean[-1]):.3f} (max {float(r_int_max[-1]):.2f})"
+               f" | emb acc {float(emb_acc[-1]):.2f} | rnd {float(rnd_l[-1]):.4f}" if ngu else "")
         )
         wandb.log(
             {
@@ -871,6 +991,10 @@ def single_run(config:dict):
                 "losses/q_values": q_val,
                 "charts/SPS": sps,
                 "charts/global_step": global_step,
+                **({"ngu/intrinsic_reward_mean": float(r_int_mean[-1]),
+                    "ngu/intrinsic_reward_max": float(r_int_max[-1]),
+                    "ngu/embedding_accuracy": float(emb_acc[-1]),
+                    "ngu/rnd_loss": float(rnd_l[-1])} if ngu else {}),
             },
             step=global_step,
         )
@@ -905,6 +1029,7 @@ def single_run(config:dict):
             dueling_units=config["DUELING_UNITS"],
             mlp_width=config.get("MLP_WIDTH", 512),
             mlp_depth=config.get("MLP_DEPTH", 2),
+            num_arms=config["NUM_ARMS"] if ngu else 0,
         ),
         seed=config["SEED"] + 42,
     )

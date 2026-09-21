@@ -23,8 +23,7 @@ WHAT THE LSTM CHANGES, COMPARED TO dqn_eval.py
  
 RETURNS
     episodic_returns        (eval_episodes,) unclipped return of each episode
-    env_states_until_done   states of episode 0 up to its first done, for video
-                            capture; None if the env does not expose them.
+    env_states_until_done   states of episode 0 up to its first done, for video capture; None if the env does not expose them.
 """
 
 from typing import Callable
@@ -73,6 +72,10 @@ def evaluate(
     vmap_step = jax.vmap(step_one)
     # ---- 3. rebuild the network and load the trained weights ---------------
     # action_dim comes from the env
+    def arm_inputs(n):
+        if (network.num_arms > 0) :
+            return (jnp.zeros((n,), jnp.int32), jnp.zeros((n,), jnp.float32))
+        return ()
 
     network = Model(action_dim=action_dim, **network_kwargs)
 
@@ -86,6 +89,7 @@ def evaluate(
         dummy_obs[None],
         jnp.zeros((1,), jnp.int32),
         jnp.zeros((1,), jnp.float32),
+        *arm_inputs(1),
     )
     with open(model_path, "rb") as f:
         (_, params) = flax.serialization.from_bytes((None, params), f.read())
@@ -99,7 +103,7 @@ def evaluate(
         # the LSTM state is carried forward; the network wipes it itself wherever
         # prev_action is -1
 
-        lstm, q_values = network.apply(params, lstm, obs, prev_action, prev_reward)
+        lstm, q_values = network.apply(params, lstm, obs, prev_action, prev_reward ,*arm_inputs(obs.shape[0]))
         greedy = q_values.argmax(axis=-1)
         random_actions = jax.random.randint(action_rng, greedy.shape, 0, action_dim)
         explore = jax.random.uniform(explore_rng, greedy.shape) < epsilon
