@@ -1011,6 +1011,32 @@ def single_run(config:dict):
         f.write(flax.serialization.to_bytes([config, carry[0].params]))
     print(f"[agent57] model saved to {model_path}")
 
+    eval_intrinsic = None
+    if ngu:
+        # [NGU] the evaluator needs the side networks and the RND statistics to
+        # compute the real intrinsic reward, so save them next to the model.
+        side, rnd_stats_final = carry[4], carry[2][5][2]
+        side_path = model_path.replace(".cleanrl_model", ".ngu_side")
+        with open(side_path, "wb") as f:
+            f.write(flax.serialization.to_bytes({
+                "emb": side["emb"].params,
+                "rnd": side["rnd"].params,
+                "rnd_target": side["rnd_target"],
+                "rnd_stats": rnd_stats_final,
+            }))
+        print(f"[agent57] NGU side networks saved to {side_path}")
+
+        def eval_intrinsic_fn(memory, obs, done):
+            emb = emb_model.apply(side["emb"].params, obs, method=EmbeddingTrainer.embed)
+            r_episodic, memory = episodic_reward(memory, emb, done, config)
+            err = rnd_error(side["rnd"].params, side["rnd_target"], rnd_net, obs)
+            return intrinsic_reward(r_episodic, rnd_modulator(err, rnd_stats_final, config)), memory
+
+        eval_intrinsic = (
+            eval_intrinsic_fn,
+            lambda n: init_episodic_memory(n, config["EPISODIC_MEMORY_SIZE"], config.get("EMBEDDING_DIM", 32)),
+        )
+
     episodic_returns, _ = evaluate(
         model_path,
         partial(
@@ -1032,6 +1058,7 @@ def single_run(config:dict):
             num_arms=config["NUM_ARMS"] if ngu else 0,
         ),
         seed=config["SEED"] + 42,
+        intrinsic=eval_intrinsic,
     )
     eval_return = float(jnp.mean(episodic_returns))
     print(f"[agent57] eval return {eval_return:.2f} (train return {avg_return:.2f})")
