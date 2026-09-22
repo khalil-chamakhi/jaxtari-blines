@@ -23,7 +23,8 @@ WHAT THE LSTM CHANGES, COMPARED TO dqn_eval.py
  
 RETURNS
     episodic_returns        (eval_episodes,) unclipped return of each episode
-    env_states_until_done   states of episode 0 up to its first done, for video capture; None if the env does not expose them.
+    env_states_until_done   states of episode 0 up to its first done, for video
+                            capture; None if the env does not expose them.
 """
 
 from typing import Callable
@@ -47,6 +48,7 @@ def evaluate(
     epsilon: float = 0.05,      # same as dqn_eval's default, so the Atari protocol matches
     seed: int = 1,
     max_steps: int = 200_000,
+    intrinsic=None,
 ):
 #Play `eval_episodes` full games with the trained weights and score them.
    # ---- 1. the evaluation environment ------------------------------------
@@ -72,12 +74,22 @@ def evaluate(
     vmap_step = jax.vmap(step_one)
     # ---- 3. rebuild the network and load the trained weights ---------------
     # action_dim comes from the env
-    def arm_inputs(n):
-        if (network.num_arms > 0) :
-            return (jnp.zeros((n,), jnp.int32), jnp.zeros((n,), jnp.float32))
-        return ()
 
     network = Model(action_dim=action_dim, **network_kwargs)
+
+    # [NGU] an NGU network also takes (arm, previous intrinsic reward). Evaluation
+    # plays arm 0, the exploitative arm (beta = 0), with the previous intrinsic
+    # reward fed as 0: no episodic memory or RND runs at eval time.
+    # [NGU] an NGU network also takes (arm, previous intrinsic reward). Evaluation
+    # plays arm 0, the exploitative arm. The previous intrinsic reward must be the
+    # real one, computed as in training: fed as a constant 0 instead, arm 0 falls
+    # from about -10 to -20 on Pong, because the network treats that input as part
+    # of the situation. `intrinsic` = (fn, init_memory), provided by single_run:
+    #   fn(memory, obs, done) -> (r_int, memory)     same pipeline as collection
+    def arm_inputs(n, prev_int):
+        if network.num_arms > 0:
+            return (jnp.zeros((n,), jnp.int32), prev_int)
+        return ()
 
     key, net_key, reset_key = jax.random.split(key, 3)
     dummy_obs, _ = reset_one(reset_key)
@@ -89,7 +101,7 @@ def evaluate(
         dummy_obs[None],
         jnp.zeros((1,), jnp.int32),
         jnp.zeros((1,), jnp.float32),
-        *arm_inputs(1),
+        *arm_inputs(1, jnp.zeros((1,), jnp.float32)),
     )
     with open(model_path, "rb") as f:
         (_, params) = flax.serialization.from_bytes((None, params), f.read())
@@ -97,13 +109,14 @@ def evaluate(
     
      # ---- 4. one step of play, for all episodes at once ---------------------
     def step_fn(carry, _):
-        obs, env_state, lstm, prev_action, prev_reward, rng = carry
+        obs, env_state, lstm, prev_action, prev_reward, prev_int, memory, rng = carry
         rng, action_rng, explore_rng = jax.random.split(rng, 3)
         
         # the LSTM state is carried forward; the network wipes it itself wherever
         # prev_action is -1
 
-        lstm, q_values = network.apply(params, lstm, obs, prev_action, prev_reward ,*arm_inputs(obs.shape[0]))
+        lstm, q_values = network.apply(params, lstm, obs, prev_action, prev_reward,
+                                       *arm_inputs(obs.shape[0], prev_int))
         greedy = q_values.argmax(axis=-1)
         random_actions = jax.random.randint(action_rng, greedy.shape, 0, action_dim)
         explore = jax.random.uniform(explore_rng, greedy.shape) < epsilon
@@ -116,11 +129,16 @@ def evaluate(
         prev_action = jnp.where(done, -1, actions)
         prev_reward = jnp.where(done, 0.0, reward)
 
+        # [NGU] intrinsic reward of the state reached, exactly as in training
+        if intrinsic is not None:
+            r_int, memory = intrinsic[0](memory, obs, done)
+            prev_int = jnp.where(done, 0.0, r_int)
+
         # env_state holds all episodes; x[0] takes episode 0's slice. Collected
         # over the scan these frames become the video of one full episode,
         # rendered for the report (CAPTURE_VIDEO), same as dqn_eval.py does.
         first_states = jax.tree.map(lambda x: x[0], env_state)
-        return (obs, env_state, lstm, prev_action, prev_reward, rng), (first_states, done, reward)
+        return (obs, env_state, lstm, prev_action, prev_reward, prev_int, memory, rng), (first_states, done, reward)
 
     @jax.jit
     def scanned_steps(carry):
@@ -138,6 +156,8 @@ def evaluate(
         Model.initial_carry(eval_episodes, network_kwargs.get("hidden_size", 512)),
         jnp.full((eval_episodes,), -1, jnp.int32),      # -1 = first step
         jnp.zeros((eval_episodes,), jnp.float32),
+        jnp.zeros((eval_episodes,), jnp.float32),                       # previous intrinsic reward
+        intrinsic[1](eval_episodes) if intrinsic is not None else (),  # a fresh episodic memory per episode
         key,
     )
 
