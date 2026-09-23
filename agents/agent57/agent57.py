@@ -906,8 +906,7 @@ def single_run(config:dict):
         if ngu:
             side, emb_acc, rnd_l = update_side(side, batch.experience)
         else:
-            emb_acc, rnd_l = jnp.float32(0.0), jnp.float32(0.0) 
-            return agent_state.replace(target_params=target_params), buffer_state, loss, q_mean, side, emb_acc, rnd_l
+            emb_acc, rnd_l = jnp.float32(0.0), jnp.float32(0.0)
         return agent_state.replace(target_params=target_params), buffer_state, side, (loss, q_mean, emb_acc, rnd_l)
 
     # --- play TRAIN_FREQUENCY steps, then learn once the buffer is warm ------
