@@ -503,7 +503,9 @@ class TimeStep:
     prev_action: jnp.ndarray    # [R2D2] the LSTM input carries the previous
     prev_reward: jnp.ndarray    #   action and reward, not just the observation. Must be STORED: a sampled sequence has no access to the step before it.
 
-    carry: tuple                     # the LSTM state at this step, stored in the buffer for burn-in 
+    
+    carry_e: tuple             # LSTM state at this step, used for burn-in. In r2d2/ngu this is the network's only carry. [SPLIT_Q] specifically Q_e's carry.
+    carry_i: tuple             # [SPLIT_Q] Q_i keeps its own carry since it has separate weights, so it can diverge from carry_e after the first step. In r2d2/ngu, this is just set to carry_e as unused padding.
 
 
     arm: jnp.ndarray            # which of the 8 (beta, gamma) policies acted
@@ -550,15 +552,32 @@ def unroll(network, params, carry, seq):
         xs = xs + (seq.arm, seq.prev_intrinsic)
     return jax.lax.scan(step, carry, xs)
 
-def r2d2_loss(params, target_params, batch , probabilities, network, cfg, arm_betas=None, arm_gammas=None):
+
+def r2d2_loss(params, target_params, batch, probabilities, network, cfg,              
+              arm_betas=None, arm_gammas=None,
+              next_action=None, reward_key="reward", carry_key="carry_e",double_q=True):
+
     """batch: TimeStep with arrays shaped (B, BURN_IN + SEQ_LEN, ...).
-    probabilities: (B,) sampling probabilities from the prioritised buffer.
-    Returns loss and (new priorities (B,), mean Q of taken actions)."""
+     probabilities: (B,) sampling probabilities from the prioritised buffer.
+     Returns loss and (new priorities (B,), mean Q of taken actions).
+     Unchanged for r2d2/ngu when next_action=None, reward_key="reward",
+     carry_key="carry_e" (all defaults).
+
+     [SPLIT_Q] next_action: precomputed (T-1, B) greedy action from the
+     COMBINED Q. Overrides the double-DQN self-argmax below, so Q_e/Q_i
+     never pick their own target action independently.
+     reward_key: "reward" or "intrinsic_reward" — which TimeStep field this
+     call trains against.
+     carry_key: "carry_e" or "carry_i" — which stored LSTM carry to burn in from."""
+
     burn_in = cfg["BURN_IN_LENGTH"]
     eps = cfg["VALUE_RESCALING_EPSILON"]
  
     data = jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), batch)      # (L, B, ...)
-    start = jax.tree.map(lambda c: c[0], data.carry)                 # stored state
+    
+
+    start = jax.tree.map(lambda c: c[0], getattr(data, carry_key))   # stored state
+
     burn = jax.tree.map(lambda x: x[:burn_in], data)
     learn = jax.tree.map(lambda x: x[burn_in:], data)
  
@@ -573,11 +592,28 @@ def r2d2_loss(params, target_params, batch , probabilities, network, cfg, arm_be
     q_target = jax.lax.stop_gradient(q_target)
  
     # 3. double Q: the online net picks the next action, the target net scores it
-    next_action = jnp.argmax(q_online[1:], axis=-1)                    # (T-1, B)
-    next_value = jnp.take_along_axis(q_target[1:], next_action[..., None], axis=-1)[..., 0]
+   
+    if next_action is None:
+        if double_q:
+            # Double-Q ON: online selects, target evaluates.
+            next_action = jnp.argmax(q_online[1:], axis=-1)
+        else:
+            # Double-Q OFF: target selects and target evaluates.
+            next_action = jnp.argmax(q_target[1:], axis=-1)
+
+    next_value = jnp.take_along_axis(
+        q_target[1:], next_action[..., None], axis=-1
+    )[..., 0]
  
     # 4. n-step target, computed in real-return space, then squashed with h
-    rewards = learn.reward[:-1]
+    
+    if reward_key == "reward":
+        rewards = learn.reward[:-1]
+    elif reward_key == "intrinsic_reward":
+        rewards = learn.intrinsic_reward[:-1]
+    else:
+        raise ValueError(f"unknown reward_key: {reward_key}")
+
     gamma = cfg["GAMMA"]
     if arm_betas is not None:
         # [NGU] each step learns from its own arm's reward mix and discount:
@@ -586,7 +622,14 @@ def r2d2_loss(params, target_params, batch , probabilities, network, cfg, arm_be
         arm = learn.arm[:-1]
         rewards = mixed_reward(rewards, learn.intrinsic_reward[:-1], arm_betas[arm])
         gamma = arm_gammas[arm]
+        
+        #Added elif
+    elif arm_gammas is not None:
+        # [SPLIT_Q] per-arm discount, same arm_schedule() as stage ngu, no reward mixing
+        arm = learn.arm[:-1]
+        gamma = arm_gammas[arm]
 
+    
     discounts = gamma * (1.0 - learn.done[:-1].astype(jnp.float32))
     returns = n_step_targets(rewards, discounts, h_inv(next_value, eps), cfg["N_STEP"])
     target = jax.lax.stop_gradient(h(returns, eps))
@@ -612,6 +655,98 @@ def r2d2_loss(params, target_params, batch , probabilities, network, cfg, arm_be
 
 
 
+# ---- Split-Q (Agent57 Sec 3.1) -----------------------------------------------
+
+def combine_q(q_e, q_i, beta):
+    """Q = Q_e + beta_j * Q_i, on RAW network outputs (h-space). h/h_inv stay
+    exactly as in r2d2_loss — applied only to the bootstrap and TD target,
+    never here. q_e, q_i: (..., A). beta: (...,) broadcastable against A."""
+    return q_e + jnp.asarray(beta)[..., None] * q_i
+
+
+def split_q_priority_from(priorities_e, priorities_i, arm, arm_betas):
+    """[SPLIT_Q] priority = priority_e + beta_arm * priority_i.
+
+    The per-network R2D2 priority (eta * max|TD| + (1-eta) * mean|TD|,
+    computed inside r2d2_loss) is specified by the paper; combining the two
+    networks' priorities into the single value the shared replay buffer
+    needs is NOT — this is the project's chosen rule, not a paper formula.
+
+    priorities_e, priorities_i: (B,) — one priority per sampled sequence.
+    arm: (B,) — each sequence's fixed arm id (arm is constant across the
+    whole sequence, see TimeStep.arm / env_arms in single_run).
+    arm_betas: (NUM_ARMS,) from arm_schedule(), same schedule stage ngu uses."""
+    beta = arm_betas[arm]
+    return priorities_e + beta * priorities_i
+
+
+def _unroll_online_q(network, params, batch, cfg, carry_key="carry_e"):
+    """Burn-in + online unroll only — no target net, no TD/loss/priority math.
+    Deliberately duplicates the opening of r2d2_loss (r2d2_loss itself is
+    left structurally untouched); used only for the shared-action pre-pass."""
+    burn_in = cfg["BURN_IN_LENGTH"]
+    data = jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), batch)
+    start = jax.tree.map(lambda c: c[0], getattr(data, carry_key))
+    burn = jax.tree.map(lambda x: x[:burn_in], data)
+    learn = jax.tree.map(lambda x: x[burn_in:], data)
+    online_carry, _ = unroll(network, params, start, burn)
+    online_carry = jax.lax.stop_gradient(online_carry)
+    _, q_online = unroll(network, params, online_carry, learn)
+    return q_online, learn.arm
+
+
+def compute_shared_next_action(network, params_e, params_i, batch, cfg, arm_betas):
+    """[SPLIT_Q] The ONE target action both losses use: argmax(Q_e + beta_j *
+    Q_i). Computed once per update, outside any grad tape. Relies on
+    env_arms being fixed per env slot for the whole run (single_run:
+    env_arms = arange(num_envs) % NUM_ARMS, never resampled)."""
+    q_online_e, arm = _unroll_online_q(network, params_e, batch, cfg, carry_key="carry_e")
+    q_online_i, _ = _unroll_online_q(network, params_i, batch, cfg, carry_key="carry_i")
+    beta = arm_betas[arm]
+    q_combined = combine_q(q_online_e, q_online_i, beta)
+    return jax.lax.stop_gradient(jnp.argmax(q_combined[1:], axis=-1))
+
+
+def update_split_q(agent_state_e, agent_state_i, buffer_state, rng, network, cfg,
+                    arm_betas, arm_gammas, replay_buffer):
+    """[SPLIT_Q] Reuses r2d2_loss once for Q_e and once for Q_i.
+    Replay priority is combined as priority_e + beta_arm * priority_i."""
+    batch = replay_buffer.sample(buffer_state, rng)
+    exp = batch.experience
+
+    shared_next_action = compute_shared_next_action(
+        network, agent_state_e.params, agent_state_i.params, exp, cfg, arm_betas)
+
+    def loss_e_fn(params_e):
+        return r2d2_loss(params_e, agent_state_e.target_params, exp, batch.probabilities,
+                          network, cfg, arm_gammas=arm_gammas, next_action=shared_next_action,
+                          reward_key="reward", carry_key="carry_e")
+
+    def loss_i_fn(params_i):
+        return r2d2_loss(params_i, agent_state_i.target_params, exp, batch.probabilities,
+                          network, cfg, arm_gammas=arm_gammas, next_action=shared_next_action,
+                          reward_key="intrinsic_reward", carry_key="carry_i")
+
+    (loss_e, (priorities_e, q_mean_e)), grads_e = jax.value_and_grad(loss_e_fn, has_aux=True)(agent_state_e.params)
+    (loss_i, (priorities_i, q_mean_i)), grads_i = jax.value_and_grad(loss_i_fn, has_aux=True)(agent_state_i.params)
+
+    agent_state_e = agent_state_e.apply_gradients(grads=grads_e)
+    agent_state_i = agent_state_i.apply_gradients(grads=grads_i)
+
+    priorities = split_q_priority_from(priorities_e, priorities_i, exp.arm[:, 0], arm_betas)
+    buffer_state = replay_buffer.set_priorities(buffer_state, batch.indices, priorities)
+
+    sync = (agent_state_e.step % cfg["TARGET_NETWORK_FREQUENCY"]) == 0
+    target_params_e = jax.lax.cond(
+        sync, lambda _: optax.incremental_update(agent_state_e.params, agent_state_e.target_params, 1.0),
+        lambda _: agent_state_e.target_params, operand=None)
+    target_params_i = jax.lax.cond(
+        sync, lambda _: optax.incremental_update(agent_state_i.params, agent_state_i.target_params, 1.0),
+        lambda _: agent_state_i.target_params, operand=None)
+
+    agent_state_e = agent_state_e.replace(target_params=target_params_e)
+    agent_state_i = agent_state_i.replace(target_params=target_params_i)
+    return agent_state_e, agent_state_i, buffer_state, loss_e, loss_i, q_mean_e, q_mean_i
 
 
 
@@ -619,9 +754,19 @@ def r2d2_loss(params, target_params, batch , probabilities, network, cfg, arm_be
 def single_run(config:dict):
     config = {k.upper(): v for k, v in config.items() if k != "alg"}
     stage = config.get("STAGE", "r2d2")
+    
+    
+
     assert stage in ("r2d2", "ngu", "split_q", "agent57"), f"unknown STAGE: {stage}"
-    assert stage in ("r2d2", "ngu"), f"STAGE={stage} is not implemented yet"
+    assert stage in ("r2d2", "ngu", "split_q"), f"STAGE={stage} is not implemented yet"
+
+
     ngu = stage == "ngu"
+
+    
+
+    split_q = stage == "split_q"
+    intrinsic_enabled = ngu or split_q   # both stages need embedding/RND + arm_schedule
 
    # do not modify the seeding
     random.seed(config["SEED"])
@@ -683,22 +828,35 @@ def single_run(config:dict):
         dueling_units=config["DUELING_UNITS"],
         mlp_width=config.get("MLP_WIDTH", 512),
         mlp_depth=config.get("MLP_DEPTH", 2),
-        num_arms=config["NUM_ARMS"] if ngu else 0,
+       
+        num_arms=config["NUM_ARMS"] if intrinsic_enabled else 0,
+
+
 
     )
-    ngu_inputs = lambda n: (jnp.zeros((n,), jnp.int32), jnp.zeros((n,), jnp.float32)) if ngu else ()
+    
+
+    ngu_inputs = lambda n: (jnp.zeros((n,), jnp.int32), jnp.zeros((n,), jnp.float32)) if intrinsic_enabled else ()
+    
     key, reset_key, net_key = jax.random.split(key, 3)
     dummy_obs, _ = env.reset(reset_key)
     dummy_obs = dummy_obs.reshape(obs_shape)
-    params = network.init(
-        net_key,
-        RecurrentQNetwork.initial_carry(1, hidden),
-        dummy_obs[None],
-        jnp.zeros((1,), jnp.int32),
-        jnp.zeros((1,), jnp.float32),
-        *ngu_inputs(1),
 
-    )
+    
+    def _init_params(k):
+        return network.init(
+            k, RecurrentQNetwork.initial_carry(1, hidden), dummy_obs[None],
+            jnp.zeros((1,), jnp.int32),
+            jnp.zeros((1,), jnp.float32),
+            *ngu_inputs(1),
+        )
+
+    if split_q:
+        net_key_e, net_key_i = jax.random.split(net_key)
+        params_e = _init_params(net_key_e)
+        params_i = _init_params(net_key_i)
+    else:
+        params = _init_params(net_key)    
 
 
     # --- replay buffer -----------------------------------------------------
@@ -720,7 +878,12 @@ def single_run(config:dict):
         reward=jnp.zeros((), dtype=jnp.float32),
         done=jnp.zeros((), dtype=jnp.bool_),
         prev_action=jnp.zeros((), dtype=jnp.int32),
-        prev_reward=jnp.zeros((), dtype=jnp.float32), carry=jax.tree.map(lambda c: c[0], RecurrentQNetwork.initial_carry(1, hidden)),
+        
+        prev_reward=jnp.zeros((), dtype=jnp.float32),
+        carry_e=jax.tree.map(lambda c: c[0], RecurrentQNetwork.initial_carry(1, hidden)),
+        carry_i=jax.tree.map(lambda c: c[0], RecurrentQNetwork.initial_carry(1, hidden)),
+        
+
         arm=jnp.zeros((), dtype=jnp.int32),
         intrinsic_reward=jnp.zeros((), dtype=jnp.float32),
         prev_intrinsic=jnp.zeros((), dtype=jnp.float32),
@@ -732,7 +895,9 @@ def single_run(config:dict):
     #   embedding   observation -> 32-d controllable state, for episodic novelty
     #   RND         frozen random target + trained predictor, for lifelong novelty
     ngu_state = {}
-    if ngu:
+   
+    if intrinsic_enabled:
+
         arm_betas, arm_gammas = arm_schedule(
             config["NUM_ARMS"], config["BETA_MAX"], config["GAMMA_MAX"], config["GAMMA_MIN"])
         env_arms = jnp.arange(num_envs, dtype=jnp.int32) % config["NUM_ARMS"]
@@ -765,9 +930,19 @@ def single_run(config:dict):
      # in order and cuts 120-step sequences out of them when sampling.
     total_timesteps = config["TOTAL_TIMESTEPS"]
     steps_per_call = config["TRAIN_FREQUENCY"]
-    def collect(params, act_state, rng, side=None):
+    
+    
+    def collect(params, act_state, rng, side=None, params_i=None):
+
         def act_step(act_state, rng):
-            env_state, obs, lstm, prev_action, prev_reward, ngu_act, global_step = act_state
+            
+            
+            if split_q:
+                env_state, obs, lstm_e, lstm_i, prev_action, prev_reward, ngu_act, global_step = act_state
+            else:
+                env_state, obs, lstm, prev_action, prev_reward, ngu_act, global_step = act_state
+
+
             action_rng, explore_rng = jax.random.split(rng)
             # same schedule as dqn.py
             epsilon = jnp.interp(
@@ -775,7 +950,10 @@ def single_run(config:dict):
                 jnp.array([0, config["EXPLORATION_FRACTION"] * total_timesteps]),
                 jnp.array([config["START_E"], config["END_E"]]),
             )
-            if ngu:
+
+            
+            if intrinsic_enabled:
+
                 memory, prev_intrinsic, rnd_stats = ngu_act
                 net_extra = (env_arms, prev_intrinsic)
             else:
@@ -783,14 +961,26 @@ def single_run(config:dict):
 
             
 
-            next_lstm, q_values = network.apply(params, lstm, obs, prev_action, prev_reward, *net_extra)
+            
+            if split_q:
+                next_lstm_e, q_e = network.apply(params, lstm_e, obs, prev_action, prev_reward, *net_extra)
+                next_lstm_i, q_i = network.apply(params_i, lstm_i, obs, prev_action, prev_reward, *net_extra)
+                q_values = combine_q(q_e, q_i, arm_betas[env_arms])
+            else:
+                next_lstm, q_values = network.apply(params, lstm, obs, prev_action, prev_reward, *net_extra)            
+            
+
+            
             greedy_actions = q_values.argmax(axis=-1)
             random_actions = jax.random.randint(action_rng, (num_envs,), 0, action_dim)
             explore_mask = jax.random.uniform(explore_rng, (num_envs,)) < epsilon
             actions = jnp.where(explore_mask, random_actions, greedy_actions)
             next_obs, env_state, rewards, next_done, info = vmap_step(env_state, actions)
             rewards = rewards.astype(jnp.float32)   # env clips to int32; the buffer and loss use float32
-            if ngu:
+            
+            
+            if intrinsic_enabled:
+
                 emb = emb_model.apply(side["emb"].params, next_obs, method=EmbeddingTrainer.embed)
                 r_episodic, memory = episodic_reward(memory, emb, next_done, config)
                 err = rnd_error(side["rnd"].params, side["rnd_target"], rnd_net, next_obs)
@@ -808,7 +998,12 @@ def single_run(config:dict):
                 done=next_done,
                 prev_action=prev_action,
                 prev_reward=prev_reward,
-                carry=lstm,                          # state BEFORE this step
+
+                
+                carry_e=(lstm_e if split_q else lstm),
+                carry_i=(lstm_i if split_q else lstm),
+
+
                 arm=arm_used,        
                 intrinsic_reward=r_int,
                 prev_intrinsic=prev_int_used,
@@ -818,11 +1013,18 @@ def single_run(config:dict):
             # the network to start from a zero carry.
             prev_action = jnp.where(next_done, -1, actions)
             prev_reward = jnp.where(next_done, 0.0, rewards)
-            if ngu:
-                # like prev_reward: a new episode starts from 0
+            
+            
+            if intrinsic_enabled:
+
                 ngu_act = (memory, jnp.where(next_done, 0.0, r_int), rnd_stats)
 
-            act_state = (env_state, next_obs, next_lstm, prev_action, prev_reward, ngu_act, global_step + num_envs)
+            if split_q:
+                act_state = (env_state, next_obs, next_lstm_e, next_lstm_i, prev_action, prev_reward, ngu_act, global_step + num_envs)
+            else:
+                act_state = (env_state, next_obs, next_lstm, prev_action, prev_reward, ngu_act, global_step + num_envs)
+
+            
             return act_state, (timestep, info)
         
         rngs = jax.random.split(rng, steps_per_call)
@@ -833,17 +1035,34 @@ def single_run(config:dict):
     
     key, reset_key = jax.random.split(key)
     obs, env_state = vmap_reset(jax.random.split(reset_key, num_envs))
-    act_state = (
-        env_state,
-        obs,
-        RecurrentQNetwork.initial_carry(num_envs, hidden),
-        jnp.full((num_envs,), -1, jnp.int32),      # -1 = first step of an episode
-        jnp.zeros((num_envs,), jnp.float32),
-        (init_episodic_memory(num_envs, config["EPISODIC_MEMORY_SIZE"], config.get("EMBEDDING_DIM", 32)),#
-        jnp.zeros((num_envs,), jnp.float32),      # previous intrinsic reward
-        init_running_stats()) if ngu else (),
-        jnp.array(0, jnp.int32),                   # global_step, in env steps
-    )
+
+    _ngu_act0 =(
+        init_episodic_memory(num_envs, config["EPISODIC_MEMORY_SIZE"], config.get("EMBEDDING_DIM", 32)),
+        jnp.zeros((num_envs,), jnp.float32), init_running_stats(),
+    ) if intrinsic_enabled else ()
+
+    if split_q:
+        act_state = (
+            env_state, obs,
+            RecurrentQNetwork.initial_carry(num_envs, hidden),
+            RecurrentQNetwork.initial_carry(num_envs, hidden),
+            jnp.full((num_envs,), -1, jnp.int32),
+            jnp.zeros((num_envs,), jnp.float32),
+            _ngu_act0,
+            jnp.array(0, jnp.int32),
+        )
+    else:
+        act_state = (
+            env_state, obs,
+            RecurrentQNetwork.initial_carry(num_envs, hidden),
+            jnp.full((num_envs,), -1, jnp.int32),
+            jnp.zeros((num_envs,), jnp.float32),
+            _ngu_act0,
+            jnp.array(0, jnp.int32),
+        )
+
+    
+
     print(f"[agent57] stage={stage} env={config['ENV_ID']} "f"{'pixel' if config['PIXEL_BASED'] else 'oc'}")
     print(f"[agent57] action_dim={action_dim} obs_shape={obs_shape} " f"obs_bytes={obs_bytes}")
     print(f"[agent57] buffer: {config['BUFFER_SIZE']} transitions = {buffer_gb:.2f} GB")
@@ -858,13 +1077,18 @@ def single_run(config:dict):
         b2=config["ADAM_B2"],
         eps=config["ADAM_EPS"],
     )
-    agent_state = Agent57TrainState.create(
-        apply_fn=network.apply,
-        params=params,
-        target_params=jax.tree.map(jnp.copy, params),
-        tx=tx,
-    )
-    loss_fn = partial(r2d2_loss, network=network, cfg=config,**({"arm_betas": arm_betas, "arm_gammas": arm_gammas} if ngu else {}))
+    
+    if split_q:
+        agent_state_e = Agent57TrainState.create(
+            apply_fn=network.apply, params=params_e, target_params=jax.tree.map(jnp.copy, params_e), tx=tx)
+        agent_state_i = Agent57TrainState.create(
+            apply_fn=network.apply, params=params_i, target_params=jax.tree.map(jnp.copy, params_i), tx=tx)
+    else:
+        agent_state = Agent57TrainState.create(
+            apply_fn=network.apply, params=params, target_params=jax.tree.map(jnp.copy, params), tx=tx)
+        loss_fn = partial(r2d2_loss, network=network, cfg=config,double_q=config.get("DOUBLE_Q", True),
+                           **({"arm_betas": arm_betas, "arm_gammas": arm_gammas} if ngu else {}))
+
 
     side_frames = config.get("NGU_TRAIN_FRAMES", 5)   # [NGU] side networks train on the last 5 frames
 
@@ -907,29 +1131,46 @@ def single_run(config:dict):
             side, emb_acc, rnd_l = update_side(side, batch.experience)
         else:
             emb_acc, rnd_l = jnp.float32(0.0), jnp.float32(0.0) 
-            return agent_state.replace(target_params=target_params), buffer_state, loss, q_mean, side, emb_acc, rnd_l
-        return agent_state.replace(target_params=target_params), buffer_state, side, (loss, q_mean, emb_acc, rnd_l)
-
+        return (
+            agent_state.replace(target_params=target_params),
+            buffer_state,
+            side,
+            (loss, q_mean, emb_acc, rnd_l),
+        )
     # --- play TRAIN_FREQUENCY steps, then learn once the buffer is warm ------
     def train_step(carry, _):
-        agent_state, buffer_state, act_state, rng, side= carry
-        rng, collect_rng, update_rng = jax.random.split(rng, 3)
+        if split_q:
+            agent_state_e, agent_state_i, buffer_state, act_state, rng, side = carry
+            rng, collect_rng, update_rng = jax.random.split(rng, 3)
+            act_state, traj, infos = collect(agent_state_e.params, act_state, collect_rng, side,
+                                              params_i=agent_state_i.params)
+            buffer_state = replay_buffer.add(buffer_state, traj)
 
-        act_state, traj, infos = collect(agent_state.params, act_state, collect_rng, side)
-        buffer_state = replay_buffer.add(buffer_state, traj)
-
-        zeros =(jnp.float32(0.0),) * 4
-        agent_state, buffer_state, side, metrics = jax.lax.cond(
-            replay_buffer.can_sample(buffer_state),
-            lambda a, b, s: update(a, b, update_rng, s),
-            lambda a, b, s: (a, b, s, zeros),
-            agent_state,
-            buffer_state,
-            side
-        )
-        r_int = traj.intrinsic_reward
-        metrics = metrics + (r_int.mean(), r_int.max())
-        return (agent_state, buffer_state, act_state, rng, side), (infos, metrics)
+            def do_update(a_e, a_i, b):
+                return update_split_q(a_e, a_i, b, update_rng, network, config, arm_betas, arm_gammas, replay_buffer)
+            def no_update(a_e, a_i, b):
+                z = jnp.float32(0.0)
+                return a_e, a_i, b, z, z, z, z
+            agent_state_e, agent_state_i, buffer_state, loss_e, loss_i, q_mean_e, q_mean_i = jax.lax.cond(
+                replay_buffer.can_sample(buffer_state), do_update, no_update,
+                agent_state_e, agent_state_i, buffer_state)
+            r_int = traj.intrinsic_reward
+            metrics = (loss_e, loss_i, q_mean_e, q_mean_i, r_int.mean(), r_int.max())
+            return (agent_state_e, agent_state_i, buffer_state, act_state, rng, side), (infos, metrics)
+        else:
+            agent_state, buffer_state, act_state, rng, side = carry
+            rng, collect_rng, update_rng = jax.random.split(rng, 3)
+            act_state, traj, infos = collect(agent_state.params, act_state, collect_rng, side)
+            buffer_state = replay_buffer.add(buffer_state, traj)
+            zeros = (jnp.float32(0.0),) * 4
+            agent_state, buffer_state, side, metrics = jax.lax.cond(
+                replay_buffer.can_sample(buffer_state),
+                lambda a, b, s: update(a, b, update_rng, s),
+                lambda a, b, s: (a,b,s,zeros),
+                agent_state, buffer_state, side)
+            r_int = traj.intrinsic_reward
+            metrics = metrics + (r_int.mean(), r_int.max())
+            return (agent_state, buffer_state, act_state, rng, side), (infos, metrics)
 
     @jax.jit
     def scanned_steps(carry):
@@ -947,7 +1188,11 @@ def single_run(config:dict):
     wandb.define_metric("*", step_metric="charts/global_step")
 
     steps_per_iteration = num_envs * steps_per_call * config["SCAN_STEPS"]
-    carry = (agent_state, buffer_state, act_state, key, ngu_state)
+    
+    if split_q:
+        carry = (agent_state_e, agent_state_i, buffer_state, act_state, key, ngu_state)
+    else:
+        carry = (agent_state, buffer_state, act_state, key, ngu_state)
 
     print(f"[agent57] compiling ({config['SCAN_STEPS']} scan steps)...")
     compile_start = time.perf_counter()
@@ -964,72 +1209,87 @@ def single_run(config:dict):
     global_step, avg_return = 0, float("nan")
     run_start = time.perf_counter()
     print(f"[agent57] training for {config['TOTAL_TIMESTEPS']} steps...")
+    act_state_idx = 3 if split_q else 2
     while global_step < config["TOTAL_TIMESTEPS"]:
         rtpt.step()
         iteration_start = time.perf_counter()
         carry, (infos, metrics) = jax.block_until_ready(scanned_steps(carry))
-        loss, q_mean, emb_acc, rnd_l, r_int_mean, r_int_max = metrics
-        global_step = int(carry[2][-1])
+        global_step = int(carry[act_state_idx][-1])
 
         avg_return = float(infos["returned_episode_returns"][-1].mean())
         avg_length = float(infos["returned_episode_lengths"][-1].mean())
-        td_loss, q_val = float(loss[-1]), float(q_mean[-1])
         sps = int(steps_per_iteration / (time.perf_counter() - iteration_start))
-        print(
-            f"[agent57] step {global_step} | return {avg_return:.2f} | length {avg_length:.0f} "
-
-            f"| loss {td_loss:.4f} | q {q_val:.3f} | SPS {sps} "
-            f"| total SPS {int(global_step / (time.perf_counter() - run_start))}"
-            + (f" | r_int {float(r_int_mean[-1]):.3f} (max {float(r_int_max[-1]):.2f})"
-               f" | emb acc {float(emb_acc[-1]):.2f} | rnd {float(rnd_l[-1]):.4f}" if ngu else "")
-        )
-        wandb.log(
-            {
-                "charts/avg_episodic_return": avg_return,
-                "charts/avg_episodic_length": avg_length,
-                "losses/td_loss": td_loss,
-                "losses/q_values": q_val,
-                "charts/SPS": sps,
-                "charts/global_step": global_step,
-                **({"ngu/intrinsic_reward_mean": float(r_int_mean[-1]),
-                    "ngu/intrinsic_reward_max": float(r_int_max[-1]),
-                    "ngu/embedding_accuracy": float(emb_acc[-1]),
-                    "ngu/rnd_loss": float(rnd_l[-1])} if ngu else {}),
-            },
-            step=global_step,
-        )
+        if split_q:
+            loss_e, loss_i, q_mean_e, q_mean_i, r_int_mean, r_int_max = metrics
+            td_loss_e, td_loss_i = float(loss_e[-1]), float(loss_i[-1])
+            print(
+                f"[agent57][split_q] step {global_step} | return {avg_return:.2f} | length {avg_length:.0f} "
+                f"| loss_e {td_loss_e:.4f} | loss_i {td_loss_i:.4f} "
+                f"| q_e {float(q_mean_e[-1]):.3f} | q_i {float(q_mean_i[-1]):.3f} | SPS {sps} "
+                f"| total SPS {int(global_step / (time.perf_counter() - run_start))} "
+                f"| r_int {float(r_int_mean[-1]):.3f} (max {float(r_int_max[-1]):.2f})"
+            )
+            wandb.log({
+                "charts/avg_episodic_return": avg_return, "charts/avg_episodic_length": avg_length,
+                "losses/td_loss_e": td_loss_e, "losses/td_loss_i": td_loss_i,
+                "losses/q_values_e": float(q_mean_e[-1]), "losses/q_values_i": float(q_mean_i[-1]),
+                "charts/SPS": sps, "charts/global_step": global_step,
+                "ngu/intrinsic_reward_mean": float(r_int_mean[-1]),
+                "ngu/intrinsic_reward_max": float(r_int_max[-1]),
+            }, step=global_step)
+        else:
+            loss, q_mean, emb_acc, rnd_l, r_int_mean, r_int_max = metrics
+            td_loss, q_val = float(loss[-1]), float(q_mean[-1])
+            print(
+                f"[agent57] step {global_step} | return {avg_return:.2f} | length {avg_length:.0f} "
+                f"| loss {td_loss:.4f} | q {q_val:.3f} | SPS {sps} "
+                f"| total SPS {int(global_step / (time.perf_counter() - run_start))}"
+                + (f" | r_int {float(r_int_mean[-1]):.3f} (max {float(r_int_max[-1]):.2f})"
+                   f" | emb acc {float(emb_acc[-1]):.2f} | rnd {float(rnd_l[-1]):.4f}" if ngu else "")
+            )
+            wandb.log(
+                {
+                    "charts/avg_episodic_return": avg_return, "charts/avg_episodic_length": avg_length,
+                    "losses/td_loss": td_loss, "losses/q_values": q_val,
+                    "charts/SPS": sps, "charts/global_step": global_step,
+                    **({"ngu/intrinsic_reward_mean": float(r_int_mean[-1]),
+                        "ngu/intrinsic_reward_max": float(r_int_max[-1]),
+                        "ngu/embedding_accuracy": float(emb_acc[-1]),
+                        "ngu/rnd_loss": float(rnd_l[-1])} if ngu else {}),
+                },
+                step=global_step,
+            )
 
     # --- save and evaluate ---------------------------------------------------
     # Training returns use clipped rewards; this is the unclipped number, the one
     # comparable to the DQN / Rainbow eval results.
-    model_path = (
-        f'{config.get("SAVE_PATH", "./models")}/{run_name}/'
-        f'{config["EXP_NAME"]}_{global_step}_{int(time.time())}.cleanrl_model'
-    )
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    with open(model_path, "wb") as f:
-        f.write(flax.serialization.to_bytes([config, carry[0].params]))
-    print(f"[agent57] model saved to {model_path}")
+    
+    if split_q:
+        model_path = (
+            f'{config.get("SAVE_PATH", "./models")}/{run_name}/'
+            f'{config["EXP_NAME"]}_{global_step}_{int(time.time())}.split_q_model'
+        )
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        with open(model_path, "wb") as f:
+            f.write(flax.serialization.to_bytes({
+                "config": config, "params_e": carry[0].params, "params_i": carry[1].params,
+            }))
+        print(f"[agent57][split_q] model saved to {model_path}")
 
-    eval_intrinsic = None
-    if ngu:
-        # [NGU] the evaluator needs the side networks and the RND statistics to
-        # compute the real intrinsic reward, so save them next to the model.
-        side, rnd_stats_final = carry[4], carry[2][5][2]
-        side_path = model_path.replace(".cleanrl_model", ".ngu_side")
+        side_final = carry[5]
+        rnd_stats_final = carry[3][6][2]   # act_state[6] = ngu_act tuple, [2] = rnd_stats
+        side_path = model_path.replace(".split_q_model", ".ngu_side")
         with open(side_path, "wb") as f:
             f.write(flax.serialization.to_bytes({
-                "emb": side["emb"].params,
-                "rnd": side["rnd"].params,
-                "rnd_target": side["rnd_target"],
-                "rnd_stats": rnd_stats_final,
+                "emb": side_final["emb"].params, "rnd": side_final["rnd"].params,
+                "rnd_target": side_final["rnd_target"], "rnd_stats": rnd_stats_final,
             }))
-        print(f"[agent57] NGU side networks saved to {side_path}")
+        print(f"[agent57][split_q] NGU side networks saved to {side_path}")
 
         def eval_intrinsic_fn(memory, obs, done):
-            emb = emb_model.apply(side["emb"].params, obs, method=EmbeddingTrainer.embed)
+            emb = emb_model.apply(side_final["emb"].params, obs, method=EmbeddingTrainer.embed)
             r_episodic, memory = episodic_reward(memory, emb, done, config)
-            err = rnd_error(side["rnd"].params, side["rnd_target"], rnd_net, obs)
+            err = rnd_error(side_final["rnd"].params, side_final["rnd_target"], rnd_net, obs)
             return intrinsic_reward(r_episodic, rnd_modulator(err, rnd_stats_final, config)), memory
 
         eval_intrinsic = (
@@ -1037,32 +1297,69 @@ def single_run(config:dict):
             lambda n: init_episodic_memory(n, config["EPISODIC_MEMORY_SIZE"], config.get("EMBEDDING_DIM", 32)),
         )
 
-    episodic_returns, _ = evaluate(
-        model_path,
-        partial(
-            make_env,
-            mods=list(config.get("TRAIN_MODS", [])),
-            pixel_based=config["PIXEL_BASED"],
-            native_downscaling=config.get("NATIVE_DOWNSCALING", True),
-            eval=True,
-        ),
-        config["ENV_ID"],
-        eval_episodes=config.get("EVAL_EPISODES", 10),
-        Model=RecurrentQNetwork,
-        network_kwargs=dict(
-            pixel_based=config["PIXEL_BASED"],
-            hidden_size=hidden,
-            dueling_units=config["DUELING_UNITS"],
-            mlp_width=config.get("MLP_WIDTH", 512),
-            mlp_depth=config.get("MLP_DEPTH", 2),
-            num_arms=config["NUM_ARMS"] if ngu else 0,
-        ),
-        seed=config["SEED"] + 42,
-        intrinsic=eval_intrinsic,
-    )
-    eval_return = float(jnp.mean(episodic_returns))
-    print(f"[agent57] eval return {eval_return:.2f} (train return {avg_return:.2f})")
-    wandb.log({"eval/episodic_return": eval_return}, step=global_step)
+        episodic_returns, _ = evaluate(   # SAME call as r2d2/ngu — evaluate() detects split_q itself
+            model_path,
+            partial(make_env, mods=list(config.get("TRAIN_MODS", [])), pixel_based=config["PIXEL_BASED"],
+                    native_downscaling=config.get("NATIVE_DOWNSCALING", True), eval=True),
+            config["ENV_ID"], eval_episodes=config.get("EVAL_EPISODES", 10), Model=RecurrentQNetwork,
+            network_kwargs=dict(
+                pixel_based=config["PIXEL_BASED"], hidden_size=hidden, dueling_units=config["DUELING_UNITS"],
+                mlp_width=config.get("MLP_WIDTH", 512), mlp_depth=config.get("MLP_DEPTH", 2),
+                num_arms=config["NUM_ARMS"],
+            ),
+            seed=config["SEED"] + 42, intrinsic=eval_intrinsic,
+        )
+        eval_return = float(jnp.mean(episodic_returns))
+        print(f"[agent57][split_q] eval return {eval_return:.2f} (train return {avg_return:.2f})")
+        wandb.log({"eval/episodic_return": eval_return}, step=global_step)
+        wandb.finish()
+        return {"default": eval_return}
+    else:
+        model_path = (
+            f'{config.get("SAVE_PATH", "./models")}/{run_name}/'
+            f'{config["EXP_NAME"]}_{global_step}_{int(time.time())}.cleanrl_model'
+        )
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        with open(model_path, "wb") as f:
+            f.write(flax.serialization.to_bytes([config, carry[0].params]))
+        print(f"[agent57] model saved to {model_path}")
 
-    wandb.finish()
-    return {"default": eval_return}
+        eval_intrinsic = None
+        if ngu:
+            side, rnd_stats_final = carry[4], carry[2][5][2]
+            side_path = model_path.replace(".cleanrl_model", ".ngu_side")
+            with open(side_path, "wb") as f:
+                f.write(flax.serialization.to_bytes({
+                    "emb": side["emb"].params, "rnd": side["rnd"].params,
+                    "rnd_target": side["rnd_target"], "rnd_stats": rnd_stats_final,
+                }))
+            print(f"[agent57] NGU side networks saved to {side_path}")
+
+            def eval_intrinsic_fn(memory, obs, done):
+                emb = emb_model.apply(side["emb"].params, obs, method=EmbeddingTrainer.embed)
+                r_episodic, memory = episodic_reward(memory, emb, done, config)
+                err = rnd_error(side["rnd"].params, side["rnd_target"], rnd_net, obs)
+                return intrinsic_reward(r_episodic, rnd_modulator(err, rnd_stats_final, config)), memory
+
+            eval_intrinsic = (
+                eval_intrinsic_fn,
+                lambda n: init_episodic_memory(n, config["EPISODIC_MEMORY_SIZE"], config.get("EMBEDDING_DIM", 32)),
+            )
+
+        episodic_returns, _ = evaluate(
+            model_path,
+            partial(make_env, mods=list(config.get("TRAIN_MODS", [])), pixel_based=config["PIXEL_BASED"],
+                    native_downscaling=config.get("NATIVE_DOWNSCALING", True), eval=True),
+            config["ENV_ID"], eval_episodes=config.get("EVAL_EPISODES", 10), Model=RecurrentQNetwork,
+            network_kwargs=dict(
+                pixel_based=config["PIXEL_BASED"], hidden_size=hidden, dueling_units=config["DUELING_UNITS"],
+                mlp_width=config.get("MLP_WIDTH", 512), mlp_depth=config.get("MLP_DEPTH", 2),
+                num_arms=config["NUM_ARMS"] if ngu else 0,
+            ),
+            seed=config["SEED"] + 42, intrinsic=eval_intrinsic,
+        )
+        eval_return = float(jnp.mean(episodic_returns))
+        print(f"[agent57] eval return {eval_return:.2f} (train return {avg_return:.2f})")
+        wandb.log({"eval/episodic_return": eval_return}, step=global_step)
+        wandb.finish()
+        return {"default": eval_return}

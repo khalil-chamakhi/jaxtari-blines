@@ -95,7 +95,7 @@ def evaluate(
     dummy_obs, _ = reset_one(reset_key)
 
     # the network is initialised with random weights first and then overwritten from the file.
-    params = network.init(
+    params_template = network.init(
         net_key,
         Model.initial_carry(1, network_kwargs.get("hidden_size", 512)),
         dummy_obs[None],
@@ -103,20 +103,58 @@ def evaluate(
         jnp.zeros((1,), jnp.float32),
         *arm_inputs(1, jnp.zeros((1,), jnp.float32)),
     )
+
+
+    # [SPLIT_Q] Peek at the saved file to tell an r2d2/ngu checkpoint
+    # ([config, params]) apart from a split_q one ({"config":..., "params_e":
+    # ..., "params_i":...}), WITHOUT changing how r2d2/ngu checkpoints load
+    # (that exact original line still runs, unchanged, in the else branch).
     with open(model_path, "rb") as f:
-        (_, params) = flax.serialization.from_bytes((None, params), f.read())
+        _raw_bytes = f.read()
+    _peek = flax.serialization.from_bytes(None, _raw_bytes)
+    split_q = isinstance(_peek, dict) and _peek.get("config", {}).get("STAGE") == "split_q"
+
+    if split_q:
+        # Deferred import: agent57.py imports `evaluate` from this module at
+        # LOAD time, so importing it at the top of this file would be
+        # circular. By the time evaluate() is actually CALLED (end of
+        # single_run), agent57.py has finished executing top to bottom.
+        from agents.agent57.agent57 import arm_schedule
+
+        saved_config = _peek["config"]
+        params_e = flax.serialization.from_state_dict(params_template, _peek["params_e"])
+        params_i = flax.serialization.from_state_dict(params_template, _peek["params_i"])
+        arm_betas, _ = arm_schedule(
+            saved_config["NUM_ARMS"], saved_config["BETA_MAX"],
+            saved_config["GAMMA_MAX"], saved_config["GAMMA_MIN"])
+        beta_0 = arm_betas[0]   # arm 0 is the evaluator's existing convention
+    else:
+        params = params_template
+        with open(model_path, "rb") as f:
+            (_, params) = flax.serialization.from_bytes((None, params), f.read())
     
     
      # ---- 4. one step of play, for all episodes at once ---------------------
     def step_fn(carry, _):
-        obs, env_state, lstm, prev_action, prev_reward, prev_int, memory, rng = carry
+        if split_q:
+            obs, env_state, lstm_e, lstm_i, prev_action, prev_reward, prev_int, memory, rng = carry
+        else:
+            obs, env_state, lstm, prev_action, prev_reward, prev_int, memory, rng = carry
         rng, action_rng, explore_rng = jax.random.split(rng, 3)
         
         # the LSTM state is carried forward; the network wipes it itself wherever
         # prev_action is -1
 
-        lstm, q_values = network.apply(params, lstm, obs, prev_action, prev_reward,
-                                       *arm_inputs(obs.shape[0], prev_int))
+        if split_q:
+            extra = arm_inputs(obs.shape[0], prev_int)   # identical inputs to both networks
+            lstm_e, q_e = network.apply(params_e, lstm_e, obs, prev_action, prev_reward, *extra)
+            lstm_i, q_i = network.apply(params_i, lstm_i, obs, prev_action, prev_reward, *extra)
+            q_values = q_e + beta_0 * q_i   # raw-output combination, no h_inv/h
+        else:
+            lstm, q_values = network.apply(params, lstm, obs, prev_action, prev_reward,
+                                           *arm_inputs(obs.shape[0], prev_int))
+        
+
         greedy = q_values.argmax(axis=-1)
         random_actions = jax.random.randint(action_rng, greedy.shape, 0, action_dim)
         explore = jax.random.uniform(explore_rng, greedy.shape) < epsilon
@@ -138,7 +176,13 @@ def evaluate(
         # over the scan these frames become the video of one full episode,
         # rendered for the report (CAPTURE_VIDEO), same as dqn_eval.py does.
         first_states = jax.tree.map(lambda x: x[0], env_state)
-        return (obs, env_state, lstm, prev_action, prev_reward, prev_int, memory, rng), (first_states, done, reward)
+        
+        if split_q:
+            return (obs, env_state, lstm_e, lstm_i, prev_action, prev_reward, prev_int, memory, rng), \
+                   (first_states, done, reward)
+        else:
+            return (obs, env_state, lstm, prev_action, prev_reward, prev_int, memory, rng), \
+                   (first_states, done, reward)
 
     @jax.jit
     def scanned_steps(carry):
@@ -150,16 +194,24 @@ def evaluate(
     reset_keys = jax.random.split(rng, eval_episodes)
     obs, env_states = vmap_reset(reset_keys)
 
-    carry = (
-        obs,
-        env_states,
-        Model.initial_carry(eval_episodes, network_kwargs.get("hidden_size", 512)),
-        jnp.full((eval_episodes,), -1, jnp.int32),      # -1 = first step
-        jnp.zeros((eval_episodes,), jnp.float32),
-        jnp.zeros((eval_episodes,), jnp.float32),                       # previous intrinsic reward
-        intrinsic[1](eval_episodes) if intrinsic is not None else (),  # a fresh episodic memory per episode
-        key,
-    )
+    if split_q:
+        carry = (
+            obs, env_states,
+            Model.initial_carry(eval_episodes, network_kwargs.get("hidden_size", 512)),   # lstm_e
+            Model.initial_carry(eval_episodes, network_kwargs.get("hidden_size", 512)),   # lstm_i
+            jnp.full((eval_episodes,), -1, jnp.int32), jnp.zeros((eval_episodes,), jnp.float32),
+            jnp.zeros((eval_episodes,), jnp.float32),
+            intrinsic[1](eval_episodes) if intrinsic is not None else (),
+            key,
+        )
+    else:
+        carry = (
+            obs, env_states, Model.initial_carry(eval_episodes, network_kwargs.get("hidden_size", 512)),
+            jnp.full((eval_episodes,), -1, jnp.int32), jnp.zeros((eval_episodes,), jnp.float32),
+            jnp.zeros((eval_episodes,), jnp.float32),
+            intrinsic[1](eval_episodes) if intrinsic is not None else (),
+            key,
+        )
 
     all_first_states, all_dones, all_rewards = [], [], []
     done_ever = jnp.zeros(eval_episodes, dtype=jnp.bool_)

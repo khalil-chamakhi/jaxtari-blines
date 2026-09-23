@@ -34,6 +34,7 @@ ADAM_B2: 0.999
 BATCH_SIZE: 32                   
 TRAIN_FREQUENCY: 4
 GAMMA: 0.99                      # same as dqn. R2D2 uses 0.997 -> report adaptation
+DOUBLE_Q: True                   #//Added By Aman , you can override it from the command line for the OFF experiment: +alg.DOUBLE_Q=false
 TAU: 1.0
 
 # --- sequence replay  ------------------------
