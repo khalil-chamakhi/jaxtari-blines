@@ -657,11 +657,11 @@ def r2d2_loss(params, target_params, batch, probabilities, network, cfg,
 
 # ---- Split-Q (Agent57 Sec 3.1) -----------------------------------------------
 
-def combine_q(q_e, q_i, beta):
+def combine_q(q_e, q_i, beta, eps):
     """Q = Q_e + beta_j * Q_i, on RAW network outputs (h-space). h/h_inv stay
     exactly as in r2d2_loss — applied only to the bootstrap and TD target,
     never here. q_e, q_i: (..., A). beta: (...,) broadcastable against A."""
-    return q_e + jnp.asarray(beta)[..., None] * q_i
+    return h(h_inv(q_e, eps) + jnp.asarray(beta)[..., None] * h_inv(q_i, eps), eps)
 
 
 def split_q_priority_from(priorities_e, priorities_i, arm, arm_betas):
@@ -703,15 +703,16 @@ def compute_shared_next_action(network, params_e, params_i, batch, cfg, arm_beta
     q_online_e, arm = _unroll_online_q(network, params_e, batch, cfg, carry_key="carry_e")
     q_online_i, _ = _unroll_online_q(network, params_i, batch, cfg, carry_key="carry_i")
     beta = arm_betas[arm]
-    q_combined = combine_q(q_online_e, q_online_i, beta)
+    q_combined = combine_q(q_online_e, q_online_i, beta, cfg["VALUE_RESCALING_EPSILON"])
     return jax.lax.stop_gradient(jnp.argmax(q_combined[1:], axis=-1))
 
 
-def update_split_q(agent_state_e, agent_state_i, buffer_state, rng, network, cfg,
-                    arm_betas, arm_gammas, replay_buffer):
+def update_split_q(agent_state_e, agent_state_i, buffer_state, batch, network, cfg, arm_betas, arm_gammas, replay_buffer):
     """[SPLIT_Q] Reuses r2d2_loss once for Q_e and once for Q_i.
-    Replay priority is combined as priority_e + beta_arm * priority_i."""
-    batch = replay_buffer.sample(buffer_state, rng)
+    Replay priority is combined as priority_e + beta_arm * priority_i.
+    The replay batch is sampled by the caller so the same batch can also train
+    the NGU embedding and RND predictor.
+    """
     exp = batch.experience
 
     shared_next_action = compute_shared_next_action(
@@ -965,7 +966,7 @@ def single_run(config:dict):
             if split_q:
                 next_lstm_e, q_e = network.apply(params, lstm_e, obs, prev_action, prev_reward, *net_extra)
                 next_lstm_i, q_i = network.apply(params_i, lstm_i, obs, prev_action, prev_reward, *net_extra)
-                q_values = combine_q(q_e, q_i, arm_betas[env_arms])
+                q_values = combine_q(q_e, q_i, arm_betas[env_arms], config["VALUE_RESCALING_EPSILON"])
             else:
                 next_lstm, q_values = network.apply(params, lstm, obs, prev_action, prev_reward, *net_extra)            
             
@@ -1142,21 +1143,42 @@ def single_run(config:dict):
         if split_q:
             agent_state_e, agent_state_i, buffer_state, act_state, rng, side = carry
             rng, collect_rng, update_rng = jax.random.split(rng, 3)
-            act_state, traj, infos = collect(agent_state_e.params, act_state, collect_rng, side,
-                                              params_i=agent_state_i.params)
+            act_state, traj, infos = collect(agent_state_e.params,act_state,collect_rng,side,params_i=agent_state_i.params,)
             buffer_state = replay_buffer.add(buffer_state, traj)
+            
+            def do_update(a_e, a_i, b, s):
+                # Sample ONCE. The same replay batch trains:
+                #   1. extrinsic Q network
+                #   2. intrinsic Q network
+                #   3. NGU embedding
+                #   4. RND predictor
+                batch = replay_buffer.sample(b, update_rng)
 
-            def do_update(a_e, a_i, b):
-                return update_split_q(a_e, a_i, b, update_rng, network, config, arm_betas, arm_gammas, replay_buffer)
-            def no_update(a_e, a_i, b):
+                a_e, a_i, b, loss_e, loss_i, q_mean_e, q_mean_i = update_split_q(
+                    a_e,
+                    a_i,
+                    b,
+                    batch,
+                    network,
+                    config,
+                    arm_betas,
+                    arm_gammas,
+                    replay_buffer,
+                )
+
+                s, emb_acc, rnd_l = update_side(s, batch.experience)
+
+                return (a_e,a_i,b,s,loss_e,loss_i,q_mean_e,q_mean_i,emb_acc,rnd_l,)
+
+            def no_update(a_e, a_i, b, s):
                 z = jnp.float32(0.0)
-                return a_e, a_i, b, z, z, z, z
-            agent_state_e, agent_state_i, buffer_state, loss_e, loss_i, q_mean_e, q_mean_i = jax.lax.cond(
-                replay_buffer.can_sample(buffer_state), do_update, no_update,
-                agent_state_e, agent_state_i, buffer_state)
+                return (a_e, a_i, b, s, z, z, z, z, z, z,)
+            (agent_state_e, agent_state_i, buffer_state, side, loss_e, loss_i, q_mean_e, q_mean_i, emb_acc, rnd_l,) = jax.lax.cond(replay_buffer.can_sample(buffer_state), do_update, no_update, agent_state_e, agent_state_i, buffer_state, side,
+            )
+            
             r_int = traj.intrinsic_reward
-            metrics = (loss_e, loss_i, q_mean_e, q_mean_i, r_int.mean(), r_int.max())
-            return (agent_state_e, agent_state_i, buffer_state, act_state, rng, side), (infos, metrics)
+            metrics = (loss_e, loss_i, q_mean_e, q_mean_i, emb_acc, rnd_l, r_int.mean(), r_int.max(), )
+            return (agent_state_e, agent_state_i, buffer_state, act_state, rng, side,), (infos, metrics)
         else:
             agent_state, buffer_state, act_state, rng, side = carry
             rng, collect_rng, update_rng = jax.random.split(rng, 3)
@@ -1220,23 +1242,31 @@ def single_run(config:dict):
         avg_length = float(infos["returned_episode_lengths"][-1].mean())
         sps = int(steps_per_iteration / (time.perf_counter() - iteration_start))
         if split_q:
-            loss_e, loss_i, q_mean_e, q_mean_i, r_int_mean, r_int_max = metrics
+            loss_e, loss_i, q_mean_e, q_mean_i, emb_acc, rnd_l, r_int_mean, r_int_max = metrics
             td_loss_e, td_loss_i = float(loss_e[-1]), float(loss_i[-1])
             print(
                 f"[agent57][split_q] step {global_step} | return {avg_return:.2f} | length {avg_length:.0f} "
                 f"| loss_e {td_loss_e:.4f} | loss_i {td_loss_i:.4f} "
                 f"| q_e {float(q_mean_e[-1]):.3f} | q_i {float(q_mean_i[-1]):.3f} | SPS {sps} "
                 f"| total SPS {int(global_step / (time.perf_counter() - run_start))} "
-                f"| r_int {float(r_int_mean[-1]):.3f} (max {float(r_int_max[-1]):.2f})"
+                f"| r_int {float(r_int_mean[-1]):.3f} (max {float(r_int_max[-1]):.2f}) "
+                f"| emb acc {float(emb_acc[-1]):.2f} | rnd {float(rnd_l[-1]):.4f}"
             )
+            
             wandb.log({
-                "charts/avg_episodic_return": avg_return, "charts/avg_episodic_length": avg_length,
-                "losses/td_loss_e": td_loss_e, "losses/td_loss_i": td_loss_i,
-                "losses/q_values_e": float(q_mean_e[-1]), "losses/q_values_i": float(q_mean_i[-1]),
-                "charts/SPS": sps, "charts/global_step": global_step,
+                "charts/avg_episodic_return": avg_return,
+                "charts/avg_episodic_length": avg_length,
+                "losses/td_loss_e": td_loss_e,
+                "losses/td_loss_i": td_loss_i,
+                "losses/q_values_e": float(q_mean_e[-1]),
+                "losses/q_values_i": float(q_mean_i[-1]),
+                "charts/SPS": sps,
+                "charts/global_step": global_step,
                 "ngu/intrinsic_reward_mean": float(r_int_mean[-1]),
                 "ngu/intrinsic_reward_max": float(r_int_max[-1]),
-            }, step=global_step)
+                "ngu/embedding_accuracy": float(emb_acc[-1]),
+                "ngu/rnd_loss": float(rnd_l[-1]),
+                }, step=global_step)
         else:
             loss, q_mean, emb_acc, rnd_l, r_int_mean, r_int_max = metrics
             td_loss, q_val = float(loss[-1]), float(q_mean[-1])
