@@ -19,7 +19,7 @@ import flax
 import jax
 import jax.numpy as jnp
 
-from agents.agent57.intrinsic import compute_intrinsic
+from agents.agent57.agent57 import compute_intrinsic
 
 
 def evaluate_policy(agent, params, env_reset, env_step, eval_episodes, key, arm=0,
@@ -64,7 +64,7 @@ def evaluate_policy(agent, params, env_reset, env_step, eval_episodes, key, arm=
     zeros = jnp.zeros((n,), jnp.float32)
     memory = None
     if agent.use_intrinsic:
-        from agents.agent57.intrinsic import init_episodic_memory
+        from agents.agent57.agent57 import init_episodic_memory
         memory = init_episodic_memory(n, int(agent.cfg["EPISODIC_MEMORY_SIZE"]), int(agent.cfg["EMBEDDING_DIM"]))
     carry = (obs, env_state, agent.network.initial_carry(n), jnp.full((n,), -1, jnp.int32),
              zeros, zeros, memory, key)
@@ -117,7 +117,7 @@ def evaluate(model_path, make_env, env_id, eval_episodes, epsilon=0.05, seed=1, 
     learner = agent.init_learner(key, obs[0])
     params = {"q_params": flax.serialization.from_state_dict(learner.q.params, raw["q_params"])}
     if agent.use_intrinsic:
-        from agents.agent57.intrinsic import init_running_stats
+        from agents.agent57.agent57 import init_running_stats
         params.update(
             emb_params=flax.serialization.from_state_dict(learner.emb.params, raw["emb_params"]),
             rnd_params=flax.serialization.from_state_dict(learner.rnd.params, raw["rnd_params"]),

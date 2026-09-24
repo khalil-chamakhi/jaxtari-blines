@@ -11,39 +11,556 @@
 #            h(h^-1(Q_e) + beta * h^-1(Q_i)).
 #   agent57  + per-actor sliding-window UCB bandit choosing the arm per episode.
 #
-# Module layout:
-#   networks.py         Q-network (split heads), embedding net, RND
-#   replay.py           TimeStep, prioritised sequence buffer, burn-in split
-#   intrinsic.py        episodic + lifelong novelty
-#   meta_controller.py  arm schedule and UCB bandit
-#   agent57.py          (this file) Agent57: act_step / learner_update /
-#                       train_iteration, all pure and jit-compatible; single_run.
-#   agent57_eval.py     evaluation
+# File layout (single module, matching feat/split-q):
+#   networks         Q-network (split heads), embedding net, RND
+#   replay           TimeStep, prioritised sequence buffer, burn-in split
+#   intrinsic        episodic + lifelong novelty
+#   meta controller  arm schedule and UCB bandit
+#   agent            Agent57: act_step / learner_update / train_iteration,
+#                    all pure and jit-compatible; make_env; single_run.
+# Evaluation lives in agent57_eval.py.
 import os
 import random
 import time
 from functools import partial
+from typing import NamedTuple
 
+import flashbax as fbx
 import flax
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 
-from agents.agent57.intrinsic import (
-    NoveltyParams, RunningStats, compute_intrinsic, embedding_loss, init_episodic_memory,
-    init_running_stats, mixed_reward, rnd_loss,
-)
-from agents.agent57.meta_controller import (
-    BanditState, arm_schedule, bandit_select, bandit_update, greedy_arm, init_bandit,
-)
-from agents.agent57.networks import EmbeddingTrainer, RNDNetwork, SplitQNetwork
-from agents.agent57.replay import (
-    TimeStep, dummy_timestep, importance_weights, make_replay_buffer, sequence_priority,
-    split_burn_in,
-)
 
+# ============================================================================
+# NETWORKS
+# ============================================================================
+# Agent57 networks.
+#
+#     Torso               observation -> features (DQN conv stack or MLP)
+#     RecurrentQNetwork   torso -> LSTM -> dueling head, one R2D2 Q-network
+#     SplitQNetwork       NUM_HEADS copies of RecurrentQNetwork with separate
+#                         weights, evaluated in ONE call via nn.vmap.
+#                         Head 0 = Q_e (extrinsic), head 1 = Q_i (intrinsic).
+#     EmbeddingTrainer    NGU controllable-state embedding + inverse dynamics
+#     RNDNetwork          NGU lifelong novelty (frozen target / trained predictor)
+#
+# Provenance: Torso, RecurrentQNetwork, EmbeddingTrainer and RNDNetwork come
+# from feat/infra and feat/ngu. SplitQNetwork replaces feat/split-q's two
+# independent network.apply calls (one per Q) with a single vmapped module.
+
+class Torso(nn.Module):
+    """Observation -> flat feature vector.
+
+    pixel  [R2D2] Table 2: "the same 3-layer convolutional network as DQN":
+           32/64/64, kernels 8/4/3, strides 4/2/1, VALID. Input (B, 4, 84, 84) uint8.
+    oc     MLP, width 512 and depth 2 by default.
+    """
+    pixel_based: bool
+    mlp_width: int = 512
+    mlp_depth: int = 2
+
+    @nn.compact
+    def __call__(self, x):
+        if self.pixel_based:
+            # stored as (B, C, H, W); flax Conv expects (B, H, W, C)
+            x = jnp.transpose(x, (0, 2, 3, 1)).astype(jnp.float32) / 255.0
+            x = nn.relu(nn.Conv(32, (8, 8), strides=(4, 4), padding="VALID")(x))
+            x = nn.relu(nn.Conv(64, (4, 4), strides=(2, 2), padding="VALID")(x))
+            x = nn.relu(nn.Conv(64, (3, 3), strides=(1, 1), padding="VALID")(x))
+            x = x.reshape((x.shape[0], -1))
+        else:
+            x = x.astype(jnp.float32)
+            for _ in range(self.mlp_depth):
+                x = nn.Dense(self.mlp_width, kernel_init=orthogonal(np.sqrt(2.0)),
+                             bias_init=constant(0.0))(x)
+                x = nn.relu(x)
+        return x
+
+
+class RecurrentQNetwork(nn.Module):
+    """[R2D2] torso -> LSTM -> dueling head.
+
+    The LSTM input is [features, one_hot(prev_action), prev_reward] and, when
+    num_arms > 0, [NGU] one_hot(arm) and the previous intrinsic reward (UVFA:
+    one set of weights plays every (beta, gamma) arm).
+
+    prev_action < 0 marks the first step of an episode; the carry is zeroed
+    there, both while acting and while unrolling replayed sequences.
+    """
+    action_dim: int
+    pixel_based: bool
+    hidden_size: int = 512
+    dueling_units: int = 512
+    mlp_width: int = 512
+    mlp_depth: int = 2
+    num_arms: int = 0
+
+    @nn.compact
+    def __call__(self, carry, obs, prev_action, prev_reward, arm, prev_intrinsic):
+        first = (prev_action < 0)[:, None]
+        carry = jax.tree.map(lambda c: jnp.where(first, 0.0, c), carry)
+        x = Torso(self.pixel_based, self.mlp_width, self.mlp_depth)(obs)
+        inputs = [x, jax.nn.one_hot(prev_action, self.action_dim), prev_reward[:, None]]
+        if self.num_arms > 0:
+            inputs += [jax.nn.one_hot(arm, self.num_arms), prev_intrinsic[:, None]]
+        carry, x = nn.OptimizedLSTMCell(self.hidden_size)(carry, jnp.concatenate(inputs, -1))
+
+        # dueling head; layer order (and so parameter names) as in feat/infra
+        v = nn.relu(nn.Dense(self.dueling_units)(x))
+        v = nn.Dense(1)(v)
+        a = nn.relu(nn.Dense(self.dueling_units)(x))
+        a = nn.Dense(self.action_dim)(a)
+        return carry, v + (a - a.mean(axis=-1, keepdims=True))
+
+
+class SplitQNetwork(nn.Module):
+    """[Agent57 sec 3.1] num_heads independent RecurrentQNetworks in one call.
+
+    Params and carry get a leading head axis; every other input is shared.
+      carry: (c, h) each (num_heads, B, hidden)
+      returns carry of the same shape and q of shape (num_heads, B, A)
+    num_heads = 1 for the r2d2/ngu stages, 2 (Q_e, Q_i) for split_q/agent57.
+    """
+    num_heads: int
+    action_dim: int
+    pixel_based: bool
+    hidden_size: int = 512
+    dueling_units: int = 512
+    mlp_width: int = 512
+    mlp_depth: int = 2
+    num_arms: int = 0
+
+    @nn.compact
+    def __call__(self, carry, obs, prev_action, prev_reward, arm, prev_intrinsic):
+        heads = nn.vmap(
+            RecurrentQNetwork,
+            variable_axes={"params": 0},
+            split_rngs={"params": True},
+            in_axes=(0, None, None, None, None, None),
+            out_axes=0,
+            axis_size=self.num_heads,
+        )
+        return heads(
+            action_dim=self.action_dim, pixel_based=self.pixel_based,
+            hidden_size=self.hidden_size, dueling_units=self.dueling_units,
+            mlp_width=self.mlp_width, mlp_depth=self.mlp_depth, num_arms=self.num_arms,
+        )(carry, obs, prev_action, prev_reward, arm, prev_intrinsic)
+
+    def initial_carry(self, batch_size):
+        z = jnp.zeros((self.num_heads, batch_size, self.hidden_size), jnp.float32)
+        return (z, z)
+
+
+class EmbeddingTrainer(nn.Module):
+    """[NGU] controllable-state embedding f(x) + inverse-dynamics classifier.
+
+    embed(obs)               -> (B, embedding_dim), linear output (compared
+                                with euclidean distances, so no ReLU)
+    classify(emb_t, emb_tp1) -> (B, action_dim) logits, 128 hidden units
+    __call__(obs, next_obs)  -> logits (used for init)
+    """
+    action_dim: int
+    pixel_based: bool
+    embedding_dim: int = 32
+    hidden: int = 128
+    mlp_width: int = 512
+    mlp_depth: int = 2
+
+    def setup(self):
+        self.torso = Torso(self.pixel_based, self.mlp_width, self.mlp_depth)
+        self.proj = nn.Dense(self.embedding_dim)
+        self.cls_hidden = nn.Dense(self.hidden)
+        self.cls_out = nn.Dense(self.action_dim)
+
+    def embed(self, obs):
+        return self.proj(self.torso(obs))
+
+    def classify(self, emb_t, emb_tp1):
+        x = nn.relu(self.cls_hidden(jnp.concatenate([emb_t, emb_tp1], axis=-1)))
+        return self.cls_out(x)
+
+    def __call__(self, obs, next_obs):
+        return self.classify(self.embed(obs), self.embed(next_obs))
+
+
+class RNDNetwork(nn.Module):
+    """[NGU] observation -> feature vector; used as frozen target and trained predictor."""
+    pixel_based: bool
+    output_dim: int = 128
+    mlp_width: int = 512
+    mlp_depth: int = 2
+
+    @nn.compact
+    def __call__(self, obs):
+        return nn.Dense(self.output_dim)(Torso(self.pixel_based, self.mlp_width, self.mlp_depth)(obs))
+
+
+# ============================================================================
+# REPLAY
+# ============================================================================
+# [R2D2] prioritised sequence replay with stored recurrent state and burn-in.
+#
+# Storage is flashbax's prioritised trajectory buffer (already a dependency on
+# master): each env's steps are kept in time order, and fixed-length windows of
+# BURN_IN_LENGTH + SEQUENCE_LENGTH steps starting every SEQUENCE_PERIOD steps
+# are sampled on device. No per-item Python slicing anywhere.
+#
+# Every step stores the LSTM carry it was acted with ("stored state"), so a
+# sampled window can be re-warmed from its real starting state and then burned
+# in for BURN_IN_LENGTH steps before the loss is taken.
+
+@flax.struct.dataclass
+class TimeStep:
+    obs: jnp.ndarray              # observation BEFORE acting. OC float32, pixel uint8 (4, 84, 84)
+    action: jnp.ndarray           # int32
+    reward: jnp.ndarray           # extrinsic reward (clipped during training), float32
+    done: jnp.ndarray             # bool, episode ended after this step
+    prev_action: jnp.ndarray      # int32, -1 on the first step of an episode
+    prev_reward: jnp.ndarray      # float32
+    carry: tuple                  # (c, h), each (num_heads, hidden): state the step was acted with
+    arm: jnp.ndarray              # int32, policy index that acted
+    intrinsic_reward: jnp.ndarray  # float32, r_i of the state reached by this step
+    prev_intrinsic: jnp.ndarray   # float32, UVFA input
+
+
+def dummy_timestep(obs, num_heads, hidden):
+    z = jnp.zeros((), jnp.float32)
+    i = jnp.zeros((), jnp.int32)
+    c = jnp.zeros((num_heads, hidden), jnp.float32)
+    return TimeStep(obs=obs, action=i, reward=z, done=jnp.zeros((), jnp.bool_), prev_action=i,
+                    prev_reward=z, carry=(c, c), arm=i, intrinsic_reward=z, prev_intrinsic=z)
+
+
+def make_replay_buffer(num_envs, batch_size, burn_in, seq_len, period, buffer_size,
+                       learning_starts, priority_exponent):
+    sample_len = burn_in + seq_len
+    return fbx.make_prioritised_trajectory_buffer(
+        add_batch_size=num_envs,
+        sample_batch_size=batch_size,
+        sample_sequence_length=sample_len,
+        period=period,
+        min_length_time_axis=max(sample_len, learning_starts // num_envs),
+        max_length_time_axis=buffer_size // num_envs,
+        priority_exponent=priority_exponent,
+    )
+
+
+def split_burn_in(experience: TimeStep, burn_in):
+    """(B, L, ...) batch -> time-major (burn, learn) segments and the start carry.
+
+    start carry: (c, h) each (num_heads, B, hidden), taken from step 0.
+    """
+    data = jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), experience)
+    start = jax.tree.map(lambda c: jnp.swapaxes(c[0], 0, 1), data.carry)
+    burn = jax.tree.map(lambda x: x[:burn_in], data)
+    learn = jax.tree.map(lambda x: x[burn_in:], data)
+    return start, burn, learn
+
+
+def importance_weights(probabilities, exponent):
+    """(1/p)^exponent, normalised by the batch max. float32."""
+    w = (1.0 / (probabilities.astype(jnp.float32) + 1e-10)) ** exponent
+    return w / jnp.max(w)
+
+
+def sequence_priority(abs_td, eta):
+    """[R2D2] eta * max_t |td| + (1 - eta) * mean_t |td|, over axis -2 (time)."""
+    return eta * abs_td.max(axis=-2) + (1.0 - eta) * abs_td.mean(axis=-2)
+
+
+# ============================================================================
+# INTRINSIC REWARD (NGU)
+# ============================================================================
+# [NGU] intrinsic reward: episodic novelty x lifelong novelty.
+#
+#     r_i = r_episodic * clip(alpha, 1, L)
+#     r   = r_e + beta_j * r_i        (single-network stages)
+#
+# r_episodic  k-NN over the controllable-state embeddings seen so far in the
+#             current episode (NGU Algorithm 1). Batched over envs, no host code.
+# alpha       RND prediction error, normalised by a running mean/std.
+#
+# Logic from feat/ngu. Changes: the k-NN distances use the matmul expansion
+# |a-b|^2 = |a|^2 + |b|^2 - 2ab (no (E, M, D) intermediate); hyperparameters
+# are a NamedTuple of Python floats instead of the whole config dict; the
+# embedding/RND updates are fused into one function that embeds each frame once.
+
+class NoveltyParams(NamedTuple):
+    num_neighbours: int = 10       # [NGU] Table 6
+    kernel_epsilon: float = 1e-4   # [NGU] Table 6
+    cluster_distance: float = 8e-3  # [NGU] Table 6
+    pseudo_count_c: float = 1e-3   # [NGU] Table 6
+    max_similarity: float = 8.0    # [NGU] Table 6
+    clip_l: float = 5.0            # [NGU] Table 6
+
+    @classmethod
+    def from_config(cls, cfg):
+        d = cls()
+        return cls(
+            num_neighbours=int(cfg.get("NUM_NEIGHBOURS", d.num_neighbours)),
+            kernel_epsilon=float(cfg.get("KERNEL_EPSILON", d.kernel_epsilon)),
+            cluster_distance=float(cfg.get("CLUSTER_DISTANCE", d.cluster_distance)),
+            pseudo_count_c=float(cfg.get("PSEUDO_COUNT_C", d.pseudo_count_c)),
+            max_similarity=float(cfg.get("MAX_SIMILARITY", d.max_similarity)),
+            clip_l=float(cfg.get("INTRINSIC_CLIP_L", d.clip_l)),
+        )
+
+
+# ---- episodic memory ---------------------------------------------------------
+@flax.struct.dataclass
+class EpisodicMemory:
+    """One preallocated ring buffer of embeddings per env."""
+    embeddings: jnp.ndarray   # (E, M, D)
+    count: jnp.ndarray        # (E,) valid slots
+    write: jnp.ndarray        # (E,) next slot
+    dist_mean: jnp.ndarray    # () running mean of squared k-NN distances
+    dist_n: jnp.ndarray       # () number of distances in that mean
+
+
+def init_episodic_memory(num_envs, size, dim):
+    return EpisodicMemory(
+        embeddings=jnp.zeros((num_envs, size, dim), jnp.float32),
+        count=jnp.zeros((num_envs,), jnp.int32),
+        write=jnp.zeros((num_envs,), jnp.int32),
+        dist_mean=jnp.array(1.0, jnp.float32),
+        dist_n=jnp.array(0.0, jnp.float32),
+    )
+
+
+def episodic_reward(memory: EpisodicMemory, embedding, first, p: NoveltyParams):
+    """[NGU] Algorithm 1 for every env at once, then store the embedding.
+
+    embedding: (E, D). first: (E,) bool, wipes that env's memory before the query.
+    Returns (reward (E,) >= 0, new memory).
+    """
+    size = memory.embeddings.shape[1]
+    k = min(p.num_neighbours, size)
+    count = jnp.where(first, 0, memory.count)
+    write = jnp.where(first, 0, memory.write)
+
+    # squared distances via |m|^2 + |x|^2 - 2 m.x : (E, M), no (E, M, D) temporary
+    m2 = jnp.sum(jnp.square(memory.embeddings), -1)
+    x2 = jnp.sum(jnp.square(embedding), -1)[:, None]
+    cross = jnp.einsum("emd,ed->em", memory.embeddings, embedding)
+    d2 = jnp.maximum(m2 + x2 - 2.0 * cross, 0.0)
+    d2 = jnp.where(jnp.arange(size)[None, :] < count[:, None], d2, jnp.inf)
+
+    neg, _ = jax.lax.top_k(-d2, k)
+    nn_d2 = -neg                                    # (E, k); inf where fewer than k exist
+    valid = jnp.isfinite(nn_d2)
+
+    n_new = jnp.sum(valid)
+    total = memory.dist_n + n_new
+    dist_mean = jnp.where(
+        n_new > 0,
+        (memory.dist_mean * memory.dist_n + jnp.sum(jnp.where(valid, nn_d2, 0.0))) / jnp.maximum(total, 1.0),
+        memory.dist_mean,
+    )
+    d_n = jnp.maximum(jnp.where(valid, nn_d2, 0.0) / jnp.maximum(dist_mean, 1e-8) - p.cluster_distance, 0.0)
+    kernel = jnp.where(valid, p.kernel_epsilon / (d_n + p.kernel_epsilon), 0.0)
+    s = jnp.sqrt(jnp.sum(kernel, -1)) + p.pseudo_count_c
+    reward = jnp.where(s > p.max_similarity, 0.0, 1.0 / s)
+    # empty memory would give 1/c = 1000 on every episode's first step (feat/ngu choice: 0)
+    reward = jnp.where(count > 0, reward, 0.0)
+
+    embeddings = jax.vmap(lambda m, w, x: m.at[w].set(x))(memory.embeddings, write, embedding)
+    return reward, EpisodicMemory(
+        embeddings=embeddings,
+        count=jnp.minimum(count + 1, size),
+        write=(write + 1) % size,
+        dist_mean=dist_mean,
+        dist_n=total,
+    )
+
+
+# ---- lifelong novelty (RND) --------------------------------------------------
+@flax.struct.dataclass
+class RunningStats:
+    mean: jnp.ndarray
+    var: jnp.ndarray
+    count: jnp.ndarray
+
+
+def init_running_stats():
+    # explicit float32: weak-typed scalars become strong after the first update,
+    # which changes the scan carry's type and forces a full recompile
+    f32 = lambda v: jnp.array(v, jnp.float32)
+    return RunningStats(mean=f32(0.0), var=f32(1.0), count=f32(1e-4))
+
+
+def update_running_stats(stats: RunningStats, x):
+    """Chan et al. parallel mean/variance update with a batch x."""
+    batch_mean, batch_var, n = jnp.mean(x), jnp.var(x), x.size
+    delta = batch_mean - stats.mean
+    total = stats.count + n
+    m2 = stats.var * stats.count + batch_var * n + jnp.square(delta) * stats.count * n / total
+    return RunningStats(mean=stats.mean + delta * n / total, var=m2 / total, count=total)
+
+
+def rnd_error(rnd_net, predictor_params, target_params, obs):
+    """Per-observation squared prediction error (B,). No gradient into the target."""
+    pred = rnd_net.apply(predictor_params, obs)
+    target = jax.lax.stop_gradient(rnd_net.apply(target_params, obs))
+    return jnp.mean(jnp.square(pred - target), axis=-1)
+
+
+def rnd_modulator(error, stats: RunningStats, clip_l):
+    """[NGU] alpha = 1 + (err - mean)/std clipped to [1, L]: only ever amplifies."""
+    alpha = 1.0 + (error - stats.mean) / jnp.sqrt(stats.var + 1e-8)
+    return jnp.clip(alpha, 1.0, clip_l)
+
+
+def intrinsic_reward(r_episodic, modulator):
+    return r_episodic * modulator
+
+
+def mixed_reward(r_extrinsic, r_intrinsic, beta):
+    """[NGU] r = r_e + beta * r_i."""
+    return r_extrinsic + beta * r_intrinsic
+
+
+def compute_intrinsic(emb_model, rnd_net, emb_params, rnd_params, rnd_target_params,
+                      memory, rnd_stats, obs, first, p: NoveltyParams, update_stats=True):
+    """Full per-step intrinsic reward pipeline, batched over envs.
+
+    Returns (r_int (E,), memory, rnd_stats). update_stats=False at evaluation.
+    """
+    emb = emb_model.apply(emb_params, obs, method="embed")
+    r_episodic, memory = episodic_reward(memory, emb, first, p)
+    err = rnd_error(rnd_net, rnd_params, rnd_target_params, obs)
+    if update_stats:
+        rnd_stats = update_running_stats(rnd_stats, err)
+    return intrinsic_reward(r_episodic, rnd_modulator(err, rnd_stats, p.clip_l)), memory, rnd_stats
+
+
+# ---- side-network losses -----------------------------------------------------
+def embedding_loss(emb_params, emb_model, obs_window, actions, mask):
+    """[NGU] inverse-dynamics cross-entropy on consecutive frames.
+
+    obs_window: (B, k+1, *obs) — every frame is embedded ONCE, then consecutive
+    embeddings are paired (feat/ngu embedded the k overlapping frames twice).
+    actions, mask: (B, k). Returns (loss, accuracy).
+    """
+    b, k1 = obs_window.shape[:2]
+    emb = emb_model.apply(emb_params, obs_window.reshape((b * k1,) + obs_window.shape[2:]),
+                          method="embed").reshape(b, k1, -1)
+    logits = emb_model.apply(emb_params, emb[:, :-1], emb[:, 1:], method="classify")
+    log_probs = jax.nn.log_softmax(logits)
+    chosen = jnp.take_along_axis(log_probs, actions[..., None], axis=-1)[..., 0]
+    denom = jnp.maximum(mask.sum(), 1.0)
+    loss = -jnp.sum(chosen * mask) / denom
+    accuracy = jnp.sum((jnp.argmax(logits, -1) == actions) * mask) / denom
+    return loss, accuracy
+
+
+def rnd_loss(predictor_params, rnd_net, target_params, obs):
+    return jnp.mean(rnd_error(rnd_net, predictor_params, target_params, obs))
+
+
+# ============================================================================
+# META-CONTROLLER (Agent57)
+# ============================================================================
+# [Agent57] policy population and sliding-window UCB meta-controller.
+#
+# Population: NUM_ARMS policies j = 0..N-1, each a (beta_j, gamma_j) pair. All
+# arms share one set of network weights (UVFA: the arm is a network input), so
+# the population dimension is handled by gathering arm_betas[arm] /
+# arm_gammas[arm] per env and per replayed step — never a Python loop over arms.
+#
+# Meta-controller: one sliding-window UCB bandit per actor (env). At the start
+# of every episode it picks the arm with the best
+#     mean_return_k + UCB_BETA * sqrt(1 / N_k)
+# over the last UCB_WINDOW episodes, or a random arm with probability
+# UCB_EPSILON. Arms absent from the window score +inf, so every arm is tried
+# first. All state is a fixed-shape pytree; updates are pure jnp.
+#
+# arm_schedule is from feat/ngu, the bandit from feat/split-q.
+
+def arm_schedule(num_arms, beta_max, gamma_max, gamma_min):
+    """[NGU] (beta_j, gamma_j) for every arm, two (num_arms,) float32 arrays.
+
+    beta_0 = 0, beta_{N-1} = beta_max, sigmoid in between.
+    1 - gamma_j interpolated log-linearly between 1 - gamma_max and 1 - gamma_min.
+    num_arms = 1 gives the single exploitative arm (beta 0, gamma_max).
+    """
+    n = int(num_arms)
+    if n == 1:
+        return jnp.zeros((1,), jnp.float32), jnp.full((1,), gamma_max, jnp.float32)
+    j = jnp.arange(n, dtype=jnp.float32)
+    inner = beta_max * jax.nn.sigmoid(10.0 * (2.0 * j - (n - 2)) / max(n - 2, 1))
+    betas = jnp.where(j == 0, 0.0, jnp.where(j == n - 1, beta_max, inner))
+    log_1mg = ((n - 1 - j) * jnp.log(1.0 - gamma_max) + j * jnp.log(1.0 - gamma_min)) / (n - 1)
+    return betas.astype(jnp.float32), (1.0 - jnp.exp(log_1mg)).astype(jnp.float32)
+
+
+@flax.struct.dataclass
+class BanditState:
+    """Ring buffers over EPISODES (not steps), one row per env."""
+    arms: jnp.ndarray      # (E, W) arm played in each remembered episode
+    returns: jnp.ndarray   # (E, W) extrinsic return of that episode
+    write: jnp.ndarray     # (E,) next slot
+    count: jnp.ndarray     # (E,) filled slots, capped at W
+
+
+def init_bandit(num_envs, window):
+    return BanditState(
+        arms=jnp.zeros((num_envs, window), jnp.int32),
+        returns=jnp.zeros((num_envs, window), jnp.float32),
+        write=jnp.zeros((num_envs,), jnp.int32),
+        count=jnp.zeros((num_envs,), jnp.int32),
+    )
+
+
+def arm_statistics(bandit: BanditState, num_arms):
+    """Per-env visit counts and mean returns inside the window, both (E, A)."""
+    window = bandit.arms.shape[1]
+    filled = jnp.arange(window)[None, :] < bandit.count[:, None]
+    is_arm = (bandit.arms[:, :, None] == jnp.arange(num_arms)[None, None, :]) & filled[:, :, None]
+    n_k = jnp.sum(is_arm, axis=1)
+    mean_k = jnp.sum(bandit.returns[:, :, None] * is_arm, axis=1) / jnp.maximum(n_k, 1)
+    return n_k, mean_k
+
+
+def bandit_select(bandit: BanditState, num_arms, rng, ucb_beta=1.0, ucb_epsilon=0.5):
+    """Arm for each env's next episode, (E,) int32 in [0, num_arms)."""
+    n_k, mean_k = arm_statistics(bandit, num_arms)
+    score = jnp.where(n_k == 0, jnp.inf, mean_k + ucb_beta * jnp.sqrt(1.0 / jnp.maximum(n_k, 1)))
+    greedy = jnp.argmax(score, axis=-1)
+    k1, k2 = jax.random.split(rng)
+    random_arm = jax.random.randint(k1, greedy.shape, 0, num_arms)
+    explore = jax.random.uniform(k2, greedy.shape) < ucb_epsilon
+    return jnp.where(explore, random_arm, greedy).astype(jnp.int32)
+
+
+def bandit_update(bandit: BanditState, arm, episode_return, done):
+    """Record (arm, return) for every env whose episode just ended (done)."""
+    window = bandit.arms.shape[1]
+    idx = bandit.write
+    put = lambda buf, i, v, d: buf.at[i].set(jnp.where(d, v, buf[i]))
+    return BanditState(
+        arms=jax.vmap(put)(bandit.arms, idx, arm.astype(jnp.int32), done),
+        returns=jax.vmap(put)(bandit.returns, idx, episode_return.astype(jnp.float32), done),
+        write=jnp.where(done, (idx + 1) % window, idx),
+        count=jnp.where(done, jnp.minimum(bandit.count + 1, window), bandit.count),
+    )
+
+
+def greedy_arm(bandit: BanditState, num_arms):
+    """Best arm by windowed mean return, pooled over envs (used for evaluation)."""
+    n_k, mean_k = arm_statistics(bandit, num_arms)
+    n = n_k.sum(0)
+    mean = (mean_k * n_k).sum(0) / jnp.maximum(n, 1)
+    return jnp.argmax(jnp.where(n > 0, mean, -jnp.inf)).astype(jnp.int32)
+
+
+# ============================================================================
+# AGENT
+# ============================================================================
 STAGES = ("r2d2", "ngu", "split_q", "agent57")
 
 # Paper values for every key the NGU / Agent57 stages need, so a config that
