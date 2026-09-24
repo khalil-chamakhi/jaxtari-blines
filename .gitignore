@@ -14,3 +14,5 @@ models/
 outputs/
 wandb/
 .DS_Store
+jaxtari-blines/
+logs/
