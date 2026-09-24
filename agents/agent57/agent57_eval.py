@@ -112,7 +112,7 @@ def evaluate(
     with open(model_path, "rb") as f:
         _raw_bytes = f.read()
     _peek = flax.serialization.from_bytes(None, _raw_bytes)
-    split_q = isinstance(_peek, dict) and _peek.get("config", {}).get("STAGE") == "split_q"
+    split_q = isinstance(_peek, dict) and _peek.get("config", {}).get("STAGE") in ("split_q", "agent57")
 
     if split_q:
         # Deferred import: agent57.py imports `evaluate` from this module at

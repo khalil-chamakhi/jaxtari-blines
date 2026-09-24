@@ -461,6 +461,69 @@ def mixed_reward(r_extrinsic, r_intrinsic, beta):
 #
 # with beta_0 = 0 and beta_{N-1} = beta_max.
 # This places more arms near low and high curiosity, and fewer in the middle.
+
+@flax.struct.dataclass
+class BanditState:
+    """[Agent57] sec. 4: one sliding-window UCB bandit per env (= per actor).
+ 
+    Each env remembers the last W episodes it played: which arm it used and what
+    undiscounted extrinsic return that episode scored. At the start of every
+    episode it picks the arm to play next from that window.
+ 
+    arms/returns are ring buffers over episodes, not steps.
+    """
+    arms: jnp.ndarray       # (E, W) arm id of each remembered episode
+    returns: jnp.ndarray    # (E, W) extrinsic return of that episode
+    write: jnp.ndarray      # (E,) next slot
+    count: jnp.ndarray      # (E,) how many slots are filled, capped at W
+ 
+ 
+def init_bandit(num_envs, window, num_arms):
+    return BanditState(
+        arms=jnp.zeros((num_envs, window), jnp.int32),
+        returns=jnp.zeros((num_envs, window), jnp.float32),
+        write=jnp.zeros((num_envs,), jnp.int32),
+        count=jnp.zeros((num_envs,), jnp.int32),
+    )
+ 
+ 
+def bandit_select(bandit, num_arms, rng, cfg):
+    """[Agent57] UCB over the window: score_k = mean return of arm k + beta * sqrt(1/N_k).
+ 
+    An arm not present in the window scores +inf, so every arm is tried before
+    the bandit starts exploiting. With probability UCB_EPSILON a random arm is
+    chosen instead, as the paper prescribes. Returns one arm per env.
+    """
+    window = bandit.arms.shape[1]
+    filled = jnp.arange(window)[None, :] < bandit.count[:, None]          # (E, W)
+    is_arm = (bandit.arms[:, :, None] == jnp.arange(num_arms)[None, None, :]) & filled[:, :, None]
+    n_k = jnp.sum(is_arm, axis=1)                                          # (E, A)
+    sum_k = jnp.sum(bandit.returns[:, :, None] * is_arm, axis=1)
+    mean_k = sum_k / jnp.maximum(n_k, 1)
+    score = jnp.where(n_k == 0, jnp.inf, mean_k + cfg.get("UCB_BETA", 1.0) * jnp.sqrt(1.0 / jnp.maximum(n_k, 1)))
+    greedy = jnp.argmax(score, axis=-1)
+ 
+    k1, k2 = jax.random.split(rng)
+    random_arm = jax.random.randint(k1, greedy.shape, 0, num_arms)
+    explore = jax.random.uniform(k2, greedy.shape) < cfg.get("UCB_EPSILON", 0.5)
+    return jnp.where(explore, random_arm, greedy).astype(jnp.int32)
+ 
+ 
+def bandit_update(bandit, arm, episode_return, done):
+    """Record (arm, return) for every env whose episode just ended."""
+    window = bandit.arms.shape[1]
+    idx = bandit.write
+    write_one = lambda buf, i, v, d: buf.at[i].set(jnp.where(d, v, buf[i]))
+    arms = jax.vmap(write_one)(bandit.arms, idx, arm, done)
+    returns = jax.vmap(write_one)(bandit.returns, idx, episode_return, done)
+    return BanditState(
+        arms=arms, returns=returns,
+        write=jnp.where(done, (idx + 1) % window, idx),
+        count=jnp.where(done, jnp.minimum(bandit.count + 1, window), bandit.count),
+    )
+ 
+
+
  
  
 def arm_schedule(num_arms, beta_max, gamma_max, gamma_min):
@@ -759,15 +822,12 @@ def single_run(config:dict):
     
 
     assert stage in ("r2d2", "ngu", "split_q", "agent57"), f"unknown STAGE: {stage}"
-    assert stage in ("r2d2", "ngu", "split_q"), f"STAGE={stage} is not implemented yet"
-
 
     ngu = stage == "ngu"
-
-    
-
-    split_q = stage == "split_q"
-    intrinsic_enabled = ngu or split_q   # both stages need embedding/RND + arm_schedule
+    meta = stage == "agent57"
+    # Agent57 uses the split-Q architecture underneath the meta-controller.
+    split_q = stage in ("split_q", "agent57")
+    intrinsic_enabled = ngu or split_q
 
    # do not modify the seeding
     random.seed(config["SEED"])
@@ -831,9 +891,6 @@ def single_run(config:dict):
         mlp_depth=config.get("MLP_DEPTH", 2),
        
         num_arms=config["NUM_ARMS"] if intrinsic_enabled else 0,
-
-
-
     )
     
 
@@ -936,15 +993,17 @@ def single_run(config:dict):
     def collect(params, act_state, rng, side=None, params_i=None):
 
         def act_step(act_state, rng):
-            
-            
-            if split_q:
+            if meta:
+                env_state, obs, lstm_e, lstm_i, prev_action, prev_reward, ngu_act, bandit, arms, global_step = act_state
+            elif split_q:
                 env_state, obs, lstm_e, lstm_i, prev_action, prev_reward, ngu_act, global_step = act_state
+                arms=env_arms
             else:
                 env_state, obs, lstm, prev_action, prev_reward, ngu_act, global_step = act_state
+                arms=env_arms if intrinsic_enabled else None
 
 
-            action_rng, explore_rng = jax.random.split(rng)
+            action_rng, explore_rng, bandit_rng = jax.random.split(rng,3)
             # same schedule as dqn.py
             epsilon = jnp.interp(
                 global_step,
@@ -954,19 +1013,18 @@ def single_run(config:dict):
 
             
             if intrinsic_enabled:
-
                 memory, prev_intrinsic, rnd_stats = ngu_act
-                net_extra = (env_arms, prev_intrinsic)
+                net_extra = (arms, prev_intrinsic)
             else:
                 net_extra = ()
-
+           
             
 
             
             if split_q:
                 next_lstm_e, q_e = network.apply(params, lstm_e, obs, prev_action, prev_reward, *net_extra)
                 next_lstm_i, q_i = network.apply(params_i, lstm_i, obs, prev_action, prev_reward, *net_extra)
-                q_values = combine_q(q_e, q_i, arm_betas[env_arms], config["VALUE_RESCALING_EPSILON"])
+                q_values = combine_q(q_e, q_i, arm_betas[arms], config["VALUE_RESCALING_EPSILON"])
             else:
                 next_lstm, q_values = network.apply(params, lstm, obs, prev_action, prev_reward, *net_extra)            
             
@@ -987,7 +1045,7 @@ def single_run(config:dict):
                 err = rnd_error(side["rnd"].params, side["rnd_target"], rnd_net, next_obs)
                 rnd_stats = update_running_stats(rnd_stats, err)
                 r_int = intrinsic_reward(r_episodic, rnd_modulator(err, rnd_stats, config))
-                arm_used, prev_int_used = env_arms, prev_intrinsic
+                arm_used, prev_int_used = arms, prev_intrinsic
             else:
                 r_int = jnp.zeros_like(rewards)
                 arm_used, prev_int_used = jnp.zeros_like(actions), jnp.zeros_like(rewards)
@@ -1017,14 +1075,20 @@ def single_run(config:dict):
             
             
             if intrinsic_enabled:
-
                 ngu_act = (memory, jnp.where(next_done, 0.0, r_int), rnd_stats)
 
-            if split_q:
-                act_state = (env_state, next_obs, next_lstm_e, next_lstm_i, prev_action, prev_reward, ngu_act, global_step + num_envs)
-            else:
-                act_state = (env_state, next_obs, next_lstm, prev_action, prev_reward, ngu_act, global_step + num_envs)
+            if meta:
+                bandit = bandit_update(bandit,arms, info["returned_episode_returns"].astype(jnp.float32),next_done,)
+                new_arms = bandit_select(bandit, config["NUM_ARMS"], bandit_rng, config,)
+                # Only environments whose episode ended switch arm.
+                arms = jnp.where(next_done, new_arms, arms)
 
+            if meta:
+                act_state = (env_state, next_obs, next_lstm_e, next_lstm_i, prev_action, prev_reward, ngu_act, bandit, arms, global_step + num_envs, )
+            elif split_q:
+                act_state = (env_state, next_obs, next_lstm_e, next_lstm_i, prev_action, prev_reward, ngu_act, global_step + num_envs,)
+            else:
+                act_state = (env_state, next_obs, next_lstm, prev_action, prev_reward, ngu_act, global_step + num_envs, )
             
             return act_state, (timestep, info)
         
@@ -1042,25 +1106,17 @@ def single_run(config:dict):
         jnp.zeros((num_envs,), jnp.float32), init_running_stats(),
     ) if intrinsic_enabled else ()
 
-    if split_q:
-        act_state = (
-            env_state, obs,
-            RecurrentQNetwork.initial_carry(num_envs, hidden),
-            RecurrentQNetwork.initial_carry(num_envs, hidden),
-            jnp.full((num_envs,), -1, jnp.int32),
-            jnp.zeros((num_envs,), jnp.float32),
-            _ngu_act0,
-            jnp.array(0, jnp.int32),
-        )
+    if meta:
+        bandit0 = init_bandit(num_envs, config.get("UCB_WINDOW", 160), config["NUM_ARMS"],)
+        
+        arms0 = jnp.zeros((num_envs,), dtype=jnp.int32)
+        act_state = (env_state, obs, RecurrentQNetwork.initial_carry(num_envs, hidden),RecurrentQNetwork.initial_carry(num_envs, hidden), jnp.full((num_envs,), -1, jnp.int32), jnp.zeros((num_envs,), jnp.float32), _ngu_act0, bandit0, arms0, jnp.array(0, jnp.int32), )
+    elif split_q:
+        act_state = (env_state, obs, RecurrentQNetwork.initial_carry(num_envs, hidden), RecurrentQNetwork.initial_carry(num_envs, hidden), jnp.full((num_envs,), -1, jnp.int32), jnp.zeros((num_envs,), jnp.float32), _ngu_act0, jnp.array(0, jnp.int32), )
     else:
-        act_state = (
-            env_state, obs,
-            RecurrentQNetwork.initial_carry(num_envs, hidden),
-            jnp.full((num_envs,), -1, jnp.int32),
-            jnp.zeros((num_envs,), jnp.float32),
-            _ngu_act0,
-            jnp.array(0, jnp.int32),
-        )
+        act_state = (env_state, obs, RecurrentQNetwork.initial_carry(num_envs, hidden), jnp.full((num_envs,), -1, jnp.int32), jnp.zeros((num_envs,), jnp.float32), _ngu_act0, jnp.array(0, jnp.int32), )
+
+
 
     
 

@@ -75,3 +75,7 @@ NUM_ARMS: 8                     # [ours] paper 32; one per env with NUM_ENVS=8
 BETA_MAX: 0.3                   # [NGU]
 GAMMA_MAX: 0.99                 # [ours] paper 0.997; equals GAMMA so arm 0 matches the R2D2 runs
 GAMMA_MIN: 0.98                 # [ours] paper 0.99; shifted down to keep the horizon spread
+# --- Agent57 meta-controller (stage 4) ---------------------------------------
+UCB_WINDOW: 30                  # [ours] paper 160; shorter runs, fewer episodes
+UCB_BETA: 1.0                   # [Agent57] Table 3
+UCB_EPSILON: 0.5                # [Agent57] Table 3: random arm with this probability
