@@ -14,7 +14,3 @@ models/
 outputs/
 wandb/
 .DS_Store
-
-# IDEs
-.idea/
-CLAUDE.md
