@@ -2,7 +2,7 @@
 import jax
 import jax.numpy as jnp
 
-from agents.agent57.replay import (
+from agents.agent57.agent57 import (
     TimeStep, dummy_timestep, importance_weights, make_replay_buffer, sequence_priority, split_burn_in,
 )
 

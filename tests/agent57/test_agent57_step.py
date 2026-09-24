@@ -121,7 +121,7 @@ def test_priority_reduces_over_time(key):
     _, (prio, _) = agent.q_loss(params, params, batch.experience, batch.probabilities)
 
     # reference: per-head TD errors via a per-head (Q_e, Q_i) loss computed by hand
-    from agents.agent57.replay import split_burn_in
+    from agents.agent57.agent57 import split_burn_in
     start, burn, learn = split_burn_in(batch.experience, agent.burn_in)
     c, _ = agent.unroll(params, start, burn)
     _, q = agent.unroll(params, c, learn)                                          # (T, H, B, A)

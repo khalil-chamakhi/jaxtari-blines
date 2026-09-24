@@ -2,11 +2,11 @@
 import jax
 import jax.numpy as jnp
 
-from agents.agent57.intrinsic import (
+from agents.agent57.agent57 import (
     NoveltyParams, compute_intrinsic, episodic_reward, init_episodic_memory, init_running_stats,
     intrinsic_reward, mixed_reward, rnd_error, rnd_modulator, update_running_stats,
 )
-from agents.agent57.networks import EmbeddingTrainer, RNDNetwork
+from agents.agent57.agent57 import EmbeddingTrainer, RNDNetwork
 
 E, D, M = 2, 8, 16
 P = NoveltyParams(num_neighbours=3)

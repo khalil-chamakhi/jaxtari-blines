@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from agents.agent57.networks import EmbeddingTrainer, RNDNetwork, SplitQNetwork, Torso
+from agents.agent57.agent57 import EmbeddingTrainer, RNDNetwork, SplitQNetwork, Torso
 
 B, OBS, A, H = 2, 6, 3, 8
 

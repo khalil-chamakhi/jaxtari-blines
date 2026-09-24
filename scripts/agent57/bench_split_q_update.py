@@ -19,7 +19,7 @@ sys.path.insert(0, _tmp)
 import jax, jax.numpy as jnp, optax
 import old_a57 as old
 from agents.agent57.agent57 import Agent57
-from agents.agent57.replay import TimeStep
+from agents.agent57.agent57 import TimeStep
 
 B, BURN, SEQ, OBS, A, HID, ARMS = 16, 20, 40, 104, 6, 128, 8
 L = BURN + SEQ

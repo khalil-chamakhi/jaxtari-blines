@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from agents.agent57.meta_controller import arm_schedule, bandit_select, bandit_update, greedy_arm, init_bandit
+from agents.agent57.agent57 import arm_schedule, bandit_select, bandit_update, greedy_arm, init_bandit
 
 E, A, W = 3, 4, 5
 
