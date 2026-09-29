@@ -1,23 +1,18 @@
-# Agent57 (Badia et al., 2020), built as an ablation ladder.
-# STAGE in the config selects how many components are enabled:
-#   r2d2     Recurrent replay DQN (Kapturowski et al., 2019). LSTM core,
-#            sequence replay with burn-in, h-transformed n-step loss,
-#            prioritised replay. Exploration is plain epsilon-greedy.
+# ATTRIBUTION
+#   acme      google-deepmind/acme, agents/jax/r2d2/learning.py @ 89080fe (Apache-2.0)
+#             n-step transformed Q-loss, priority mixture, burn-in layout.
+#             Changed: plain JAX instead of rlax; stop_gradient at the burn-in boundary.
+#   rlax      google-deepmind/rlax, _src/multistep.py, transforms.py (Apache-2.0)
+#             Value rescaling and n-step returns. Changed: rewritten to avoid the
+#             dependency; h_inv rearranged for float32 precision.
+#   flashbax  instadeepai/flashbax, prioritised trajectory buffer, used as a library.
+#   this repo agents/dqn/dqn.py and dqn_eval.py: make_env, epsilon schedule and the
+#             evaluation structure. Changed: recurrent evaluator, LSTM state threading.
+#             agents/rainbow/rainbow.py: prioritised replay usage and dtype pattern.
 #
-#   ngu      Never Give Up (Badia et al., 2020). Adds an intrinsic reward
-#            from episodic novelty (k-NN in a learned embedding space) 
-#            multiplied by a lifelong novelty modulator (RND). Trains a
-#            family of NUM_ARMS policies, each with its own (beta, gamma).
-#
-#   split_q  Separate Q_e and Q_i networks, acting on Q_e + beta_j * Q_i.
-#            Extrinsic and intrinsic rewards differ by orders of magnitude,
-#            and one shared network is unstable.
-#
-#   agent57  A sliding-window UCB bandit selects which arm to act with each
-#            episode, so the exploration/exploitation trade-off is learned
-#            per game rather than fixed.
-#
-# Each stage is a checkpoint: it must train before the next is enabled.
+#   Algorithms follow R2D2 (Kapturowski et al., ICLR 2019), NGU (Badia et al., ICLR
+#   2020) and Agent57 (Badia et al., ICML 2020). Deviations are listed in the report.
+
 import os
 import random
 import time
